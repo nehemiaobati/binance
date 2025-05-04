@@ -1,0 +1,14 @@
+{
+    "require": {
+        "react/event-loop": "^1.5",
+        "react/socket": "^1.11",
+        "react/http": "^1.10",
+        "ratchet/pawl": "^0.4.1", 
+        "monolog/monolog": "^2.9 || ^3.0" 
+    },
+    "autoload": {
+        "psr-4": {
+            "YourApp\\": "src/"
+        }
+    }
+}
