@@ -1,4 +1,4 @@
-<?php
+<?php // autov2.php
 
 declare(strict_types=1); // Enable strict types for better code quality
 
@@ -29,7 +29,7 @@ if ($apiKey === 'YOUR_DEFAULT_KEY_FALLBACK' || $apiSecret === 'YOUR_DEFAULT_SECR
 
 // --- Trading Bot Class ---
 
-class TradingBot
+class DynamicTradingBot // Renamed class
 {
     // --- Constants ---
     private const REST_API_BASE_URL = 'https://api.binance.com';
@@ -59,9 +59,10 @@ class TradingBot
     private ?WebSocket $wsConnection = null; // Store WS connection
 
     // --- State Properties ---
-    private ?float $initialBaseBalance = null;
-    private ?float $initialQuoteBalance = null;
-    private ?float $initialPrice = null;
+    private ?float $initialBaseBalance = null; // Keep initial balance for reference if needed
+    private ?float $initialQuoteBalance = null; // Keep initial balance for reference if needed
+    private ?float $referencePrice = null; // *** RENAMED: This price will be updated ***
+    private ?float $lastKlinePrice = null; // *** NEW: Store the last price received from WS ***
     private ?string $activeOrderId = null; // Stores the ID of the currently active Convert Limit order
     private ?int $orderPlaceTime = null; // Stores the timestamp when the order was placed
     private bool $isPlacingOrder = false; // Flag to prevent multiple order attempts concurrently
@@ -106,10 +107,10 @@ class TradingBot
         // Log to standard output (stdout)
         $streamHandler = new StreamHandler('php://stdout', Logger::DEBUG); // Set minimum log level (e.g., DEBUG, INFO)
         $streamHandler->setFormatter($formatter);
-        $this->logger = new Logger('TradingBot');
+        $this->logger = new Logger('DynamicTradingBot'); // Updated logger name
         $this->logger->pushHandler($streamHandler);
 
-        $this->logger->info('TradingBot instance created.');
+        $this->logger->info('DynamicTradingBot instance created.');
     }
 
     /**
@@ -125,18 +126,19 @@ class TradingBot
             $this->getLatestKlineClosePrice($this->symbol, $this->klineInterval),
         ])->then(
             function ($results) {
-                $this->initialBaseBalance = (float)$results[0];
-                $this->initialQuoteBalance = (float)$results[1];
-                $this->initialPrice = (float)$results[2];
+                $this->initialBaseBalance = (float)$results[0]; // Store absolute initial balance
+                $this->initialQuoteBalance = (float)$results[1]; // Store absolute initial balance
+                $this->referencePrice = (float)$results[2]; // Set the *first* reference price
+                $this->lastKlinePrice = $this->referencePrice; // Initialize last kline price
 
-                if ($this->initialPrice === null || $this->initialPrice <= 0) {
-                    throw new \RuntimeException("Failed to fetch a valid initial price.");
+                if ($this->referencePrice === null || $this->referencePrice <= 0) {
+                    throw new \RuntimeException("Failed to fetch a valid initial reference price.");
                 }
 
                 $this->logger->info('Initialization Success', [
                     'initial_' . $this->convertBaseAsset . '_balance' => $this->initialBaseBalance,
                     'initial_' . $this->convertQuoteAsset . '_balance' => $this->initialQuoteBalance,
-                    'initial_price_' . $this->symbol => $this->initialPrice,
+                    'initial_reference_price_' . $this->symbol => $this->referencePrice, // Log the first reference price
                 ]);
 
                 $this->connectWebSocket();
@@ -191,7 +193,7 @@ class TradingBot
 
                 $conn->on('error', function (\Throwable $e) {
                     $this->logger->error('WebSocket error', ['exception' => $e->getMessage()]);
-                    $this->stop();
+                    $this->stop(); // Consider reconnection logic here for resilience
                 });
 
                 $conn->on('close', function ($code = null, $reason = null) {
@@ -202,6 +204,7 @@ class TradingBot
             },
             function (\Throwable $e) {
                 $this->logger->error('WebSocket connection failed', ['exception' => $e->getMessage()]);
+                 // Consider retry logic here before stopping
                 $this->stop();
             }
         );
@@ -244,12 +247,6 @@ class TradingBot
      */
     private function handleWsMessage(string $msg): void
     {
-        // Ignore messages if an order is pending, active, or currently being placed
-        if ($this->activeOrderId !== null || $this->isPlacingOrder) {
-            // $this->logger->debug('Ignoring WS message, order check/placement active.'); // Can be noisy
-            return;
-        }
-
         $data = json_decode($msg, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
             $this->logger->warning('Failed to decode WebSocket message JSON', ['message' => substr($msg, 0, 100)]);
@@ -267,15 +264,25 @@ class TradingBot
         }
 
         $current_price = (float)$data['k']['c'];
+        $this->lastKlinePrice = $current_price; // *** STORE the latest price ***
         // $this->logger->debug('Received kline update', ['price' => $current_price]); // Can be noisy
 
-        if ($this->initialPrice === null) {
-             $this->logger->warning('Initial price not set, cannot evaluate triggers.');
+
+        // Ignore price checks if an order is pending, active, or currently being placed
+        if ($this->activeOrderId !== null || $this->isPlacingOrder) {
+            // $this->logger->debug('Ignoring WS message for trigger check, order processing active.'); // Can be noisy
+            return;
+        }
+
+
+        if ($this->referencePrice === null) {
+             $this->logger->warning('Reference price not set, cannot evaluate triggers.');
              return; // Should not happen after initialization success, but safety check
         }
 
-        $trigger_price_up = $this->initialPrice * (1 + $this->triggerMarginPercent / 100);
-        $trigger_price_down = $this->initialPrice * (1 - $this->triggerMarginPercent / 100);
+        // *** USE referencePrice for triggers ***
+        $trigger_price_up = $this->referencePrice * (1 + $this->triggerMarginPercent / 100);
+        $trigger_price_down = $this->referencePrice * (1 - $this->triggerMarginPercent / 100);
 
         $order_side = null;
         $trigger_met = false;
@@ -285,6 +292,7 @@ class TradingBot
             $trigger_met = true;
             $this->logger->info('Price rise trigger met', [
                 'current_price' => $current_price,
+                'reference_price' => $this->referencePrice, // Log reference price
                 'trigger_price_up' => $trigger_price_up,
                 'order_side' => $order_side
             ]);
@@ -293,6 +301,7 @@ class TradingBot
             $trigger_met = true;
              $this->logger->info('Price drop trigger met', [
                 'current_price' => $current_price,
+                'reference_price' => $this->referencePrice, // Log reference price
                 'trigger_price_down' => $trigger_price_down,
                 'order_side' => $order_side
             ]);
@@ -316,7 +325,7 @@ class TradingBot
             return;
         }
         $this->isPlacingOrder = true; // Set flag
-        $this->logger->info('Order trigger met. Initiating order placement process...', ['side' => $orderSide]);
+        $this->logger->info('Order trigger met. Initiating order placement process...', ['side' => $orderSide, 'trigger_price' => $currentPrice]);
 
         $relevant_asset = ($orderSide === 'BUY') ? $this->convertQuoteAsset : $this->convertBaseAsset;
 
@@ -340,7 +349,7 @@ class TradingBot
                  return \React\Promise\reject(new \DomainException('Calculated amount is zero or negative')); // Stop this chain explicitly
             }
 
-            // Calculate the limit price with margin
+            // Calculate the limit price with margin relative to the trigger price
             $limit_price = ($orderSide === 'BUY')
                 ? $currentPrice * (1 - $this->orderPriceMarginPercent / 100) // Buy lower than trigger price
                 : $currentPrice * (1 + $this->orderPriceMarginPercent / 100); // Sell higher than trigger price
@@ -379,11 +388,13 @@ class TradingBot
                     'orderId' => $this->activeOrderId,
                     'place_time' => date('Y-m-d H:i:s', $this->orderPlaceTime)
                 ]);
+                 // DO NOT reset reference price here. Wait for the order cycle to complete.
             } else {
                  // Should ideally be caught by makeAsyncApiRequest, but double check
                  $this->logger->error('Order placement API call succeeded but response lacked orderId', ['response' => $orderData]);
                  // Even though order placement *may* have happened, we don't have an ID to track.
                  // Clear the placing flag to allow future attempts, but log the error.
+                 // Also, don't update reference price as the cycle didn't properly start/track.
             }
              $this->isPlacingOrder = false; // Clear flag on success/completion of this step
         })
@@ -391,7 +402,7 @@ class TradingBot
              // Catch errors from getSpecificAssetBalance OR placeConvertLimitOrder OR the DomainException above
              $this->logger->error('Failed during order placement chain', ['exception' => $e->getMessage()]);
              $this->isPlacingOrder = false; // Clear flag on failure
-             // Keep monitoring price after failure
+             // Keep monitoring price after failure, reference price remains unchanged.
         });
     }
 
@@ -420,7 +431,7 @@ class TradingBot
 
             if (in_array($currentStatus, $finishedStatuses)) {
                  $this->logger->info('Active order is finished.', ['orderId' => $orderIdToCheck, 'status' => $currentStatus]);
-                 $this->clearActiveOrderState();
+                 $this->clearActiveOrderState(); // *** THIS WILL NOW UPDATE referencePrice ***
 
             } elseif (in_array($currentStatus, $pendingStatuses)) {
                  // Order is still open/pending, check cancellation timeout
@@ -440,16 +451,17 @@ class TradingBot
                      $this->cancelConvertLimitOrder($orderIdToCheck)
                      ->then(function ($result) use ($orderIdToCheck) {
                           $this->logger->info('Cancellation attempt processed for order. Clearing state.', ['orderId' => $orderIdToCheck, 'api_result_preview' => substr(json_encode($result), 0, 100)]);
-                          $this->clearActiveOrderState();
+                          $this->clearActiveOrderState(); // *** THIS WILL NOW UPDATE referencePrice ***
                      })
                      ->catch(function (\Throwable $e) use ($orderIdToCheck) {
                            $this->logger->error('Failed to cancel order due to API/HTTP error during timeout cancellation. Clearing state anyway.', [
                                'orderId' => $orderIdToCheck,
                                'exception' => $e->getMessage()
                            ]);
-                           $this->clearActiveOrderState();
+                           $this->clearActiveOrderState(); // *** THIS WILL NOW UPDATE referencePrice ***
                      });
                  }
+                 // If not cancelling, reference price remains unchanged.
              } else {
                  // Status is not recognized as pending or finished
                  $this->logger->warning('Unrecognized order status received from getConvertOrderStatus.', [
@@ -457,7 +469,7 @@ class TradingBot
                     'status' => $currentStatus,
                     'responseData' => $orderStatusData
                  ]);
-                 // Treat as pending for timeout purposes, but log warning.
+                 // Treat as pending for timeout purposes, but log warning. Reference price unchanged.
                  // (Add timeout check here identical to the one above if desired for unknown states)
              }
         })
@@ -472,31 +484,49 @@ class TradingBot
                       'orderId_checked' => $orderIdToCheck,
                       'exception' => $errorMessage
                   ]);
-                  $this->clearActiveOrderState();
+                  $this->clearActiveOrderState(); // *** THIS WILL NOW UPDATE referencePrice ***
              } else {
                  // For other errors (network, unexpected API issues), log and retry next time.
                  $this->logger->error('Failed to get order status during check', [
                      'orderId_checked' => $orderIdToCheck,
                      'exception' => $errorMessage
                  ]);
-                 // Do NOT clear state here. If the query failed for other reasons, retry.
+                 // Do NOT clear state here. If the query failed for other reasons, retry. Reference price unchanged.
              }
         });
     }
 
     /**
-     * Clears the state related to an active order.
+     * Clears the state related to an active order AND resets the reference price.
      */
     private function clearActiveOrderState(): void
     {
-         $this->logger->debug('Clearing active order state', ['previous_order_id' => $this->activeOrderId]);
+         $previousOrderId = $this->activeOrderId; // Store for logging
+         $this->logger->debug('Clearing active order state', ['previous_order_id' => $previousOrderId]);
          $this->activeOrderId = null;
          $this->orderPlaceTime = null;
          $this->isPlacingOrder = false; // Ensure flag is clear
+
+         // *** DYNAMIC PRICE LOGIC: Update reference price to the last known kline price ***
+         if ($this->lastKlinePrice !== null && $this->lastKlinePrice > 0) {
+            $this->logger->info('Updating reference price after order cycle completion.', [
+                'previous_order_id' => $previousOrderId, // Context: which order cycle finished
+                'old_reference_price' => $this->referencePrice,
+                'new_reference_price' => $this->lastKlinePrice,
+            ]);
+            $this->referencePrice = $this->lastKlinePrice;
+         } else {
+             $this->logger->warning('Could not update reference price: lastKlinePrice is not available. Keeping old reference.', [
+                  'previous_order_id' => $previousOrderId,
+                  'reference_price' => $this->referencePrice
+             ]);
+             // If this happens, the reference price remains stale until the next WS message updates lastKlinePrice
+             // AND the *next* order cycle completes. Consider fetching price explicitly if this state is undesirable.
+         }
     }
 
 
-    // --- API Helper Methods ---
+    // --- API Helper Methods (Unchanged from original auto.php) ---
 
     /**
      * Creates signed request data including timestamp, recvWindow, and signature.
@@ -660,7 +690,7 @@ class TradingBot
             ->catch(function (\Throwable $e) use ($logContext) {
                  // Error already logged by makeAsyncApiRequest
                  $this->logger->error('Failure in getSpecificAssetBalance chain', $logContext + ['exception' => $e->getMessage()]);
-                 throw $e; // Re-throw to propagate failure (caught by initialization)
+                 throw $e; // Re-throw to propagate failure (caught by initialization or attemptPlaceOrder)
              });
     }
 
@@ -845,21 +875,21 @@ class TradingBot
 
 // --- Script Execution ---
 
-$bot = new TradingBot(
+$bot = new DynamicTradingBot( // Use the updated class name
     apiKey: $apiKey,
     apiSecret: $apiSecret,
     symbol: 'BTCUSDT',             // Symbol to monitor
-    klineInterval: '1s',           // Price update interval
+    klineInterval: '1s',           // Price update interval (1s is very fast for Convert, consider 1m?)
     convertBaseAsset: 'BTC',       // Base asset for Convert trades
     convertQuoteAsset: 'USDT',     // Quote asset for Convert trades
-    orderSideOnPriceDrop: 'BUY',   // Action when price drops below trigger
-    orderSideOnPriceRise: 'SELL',  // Action when price rises above trigger
+    orderSideOnPriceDrop: 'BUY',   // Action when price drops below trigger (relative to referencePrice)
+    orderSideOnPriceRise: 'SELL',  // Action when price rises above trigger (relative to referencePrice)
     amountPercentage: 10.0,        // % of available relevant balance to use
-    triggerMarginPercent: 0.01,    // % deviation from initial price to trigger
-    orderPriceMarginPercent: 0.05, // % deviation from current price for limit order
+    triggerMarginPercent: 0.01,    // % deviation from reference price to trigger (e.g., 0.1% = 0.1)
+    orderPriceMarginPercent: 0.02, // % deviation from current price for limit order (e.g., 0.05% = 0.05)
     orderCheckIntervalSeconds: 5,  // How often to check active order status
-    cancelAfterSeconds: 10,       // Auto-cancel order after 10 minutes (600s)
-    maxScriptRuntimeSeconds: 3600  // Max script runtime 1 hour (3600s)
+    cancelAfterSeconds: 10,       // Auto-cancel order after 10 minutes (600s) - Adjust as needed
+    maxScriptRuntimeSeconds: 36000   // Max script runtime 1 hour (3600s) - Adjust as needed
 );
 
 $bot->run();
