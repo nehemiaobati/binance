@@ -12,6 +12,9 @@ use React\Http\Browser;
 use Psr\Http\Message\ResponseInterface;
 use React\Promise\PromiseInterface;
 use React\Promise\Deferred;
+// We will use \React\Promise\all directly, so the alias is not strictly needed
+// but keeping it doesn't hurt and shows intent.
+use React\Promise\all as PromiseAll;
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use Monolog\Formatter\LineFormatter;
@@ -66,9 +69,7 @@ class AiTradingBot
     private ?WebSocket $wsConnection = null;
 
     // --- State Properties ---
-    private ?float $initialBaseBalance = null;
-    private ?float $initialQuoteBalance = null;
-    private ?float $initialPrice = null; // This is the reference price, now AI-updatable
+    private ?float $initialPrice = null;
     private ?float $lastClosedKlinePrice = null;
     private ?string $activeOrderId = null;
     private ?array $activeOrderDetails = null;
@@ -142,24 +143,24 @@ class AiTradingBot
     public function run(): void
     {
         $this->logger->info('Starting AI Trading Bot initialization...');
-        \React\Promise\all([
-            $this->getSpecificAssetBalance($this->convertBaseAsset),
-            $this->getSpecificAssetBalance($this->convertQuoteAsset),
-            $this->getLatestKlineClosePrice($this->symbol, $this->klineInterval),
+        \React\Promise\all([ // Use fully qualified name
+            'startup_base_bal' => $this->getSpecificAssetBalance($this->convertBaseAsset),
+            'startup_quote_bal' => $this->getSpecificAssetBalance($this->convertQuoteAsset),
+            'initial_price' => $this->getLatestKlineClosePrice($this->symbol, $this->klineInterval),
         ])->then(
             function ($results) {
-                $this->initialBaseBalance = (float)$results[0];
-                $this->initialQuoteBalance = (float)$results[1];
-                $this->initialPrice = (float)$results[2]; // Sets the very first reference price
+                $startupBaseBal = (float)$results['startup_base_bal'];
+                $startupQuoteBal = (float)$results['startup_quote_bal'];
+                $this->initialPrice = (float)$results['initial_price'];
                 $this->lastClosedKlinePrice = $this->initialPrice;
 
                 if ($this->initialPrice === null || $this->initialPrice <= 0) {
                     throw new \RuntimeException("Failed to fetch a valid initial price.");
                 }
                 $this->logger->info('Initialization Success', [
-                    'initial_' . $this->convertBaseAsset . '_balance' => $this->initialBaseBalance,
-                    'initial_' . $this->convertQuoteAsset . '_balance' => $this->initialQuoteBalance,
-                    'initial_reference_price_' . $this->symbol => $this->initialPrice, // Logged as reference price
+                    'startup_' . $this->convertBaseAsset . '_balance' => $startupBaseBal,
+                    'startup_' . $this->convertQuoteAsset . '_balance' => $startupQuoteBal,
+                    'initial_reference_price_' . $this->symbol => $this->initialPrice,
                 ]);
                 $this->connectWebSocket();
                 $this->setupTimers();
@@ -242,12 +243,11 @@ class AiTradingBot
         $currentPrice = (float)$data['k']['c'];
         $this->lastClosedKlinePrice = $currentPrice;
 
-        if ($this->initialPrice === null) { // This is the reference price
+        if ($this->initialPrice === null) {
              $this->logger->warning('Reference price (initialPrice) not set, cannot evaluate triggers from WS.');
              return;
         }
 
-        // Use initialPrice (reference price) for triggering
         $triggerPriceUp = $this->initialPrice * (1 + $this->triggerMarginPercent / 100);
         $triggerPriceDown = $this->initialPrice * (1 - $this->triggerMarginPercent / 100);
         $orderSide = null;
@@ -513,9 +513,11 @@ class AiTradingBot
                 if (!is_array($data)) throw new \RuntimeException("Invalid response for getUserAsset: not an array.");
                 foreach ($data as $assetInfo) {
                     if (isset($assetInfo['asset'], $assetInfo['free']) && $assetInfo['asset'] === $asset) {
+                        $this->logger->debug("Fetched balance for data collection", ['asset' => $asset, 'balance' => (float)$assetInfo['free']]);
                         return (float)$assetInfo['free'];
                     }
                 }
+                $this->logger->warning("Asset not found in getUserAsset response", ['asset' => $asset]);
                 return 0.0;
             });
     }
@@ -569,10 +571,12 @@ class AiTradingBot
             return;
         }
         $this->logger->info('Starting AI parameter update cycle...');
-        $dataForAI = $this->collectDataForAI();
-        $promptPayload = $this->constructAIPrompt($dataForAI);
 
-        $this->sendRequestToAI($promptPayload)
+        $this->collectDataForAI()
+            ->then(function (array $dataForAI) {
+                $promptPayload = $this->constructAIPrompt($dataForAI);
+                return $this->sendRequestToAI($promptPayload);
+            })
             ->then(
                 function ($rawResponse) {
                     return $this->processAIResponse($rawResponse);
@@ -580,33 +584,49 @@ class AiTradingBot
             )
             ->catch(function (\Throwable $e) {
                 if (!($e->getCode() === 429)) {
-                    $this->logger->error('AI update cycle failed after processing or final attempt.', ['exception' => $e->getMessage()]);
+                    $this->logger->error('AI update cycle failed.', ['exception' => $e->getMessage()]);
                 }
             });
     }
 
-    private function collectDataForAI(): array
+    private function collectDataForAI(): PromiseInterface
     {
-        return [
-            'current_asset_price' => $this->lastClosedKlinePrice ?? $this->initialPrice,
-            'recent_order_logs' => $this->recentOrderLogs,
-            'current_parameters' => [
-                'initialPrice' => $this->initialPrice, // Current reference price
-                'amountPercentage' => $this->amountPercentage,
-                'triggerMarginPercent' => $this->triggerMarginPercent,
-                'orderPriceMarginPercent' => $this->orderPriceMarginPercent,
-                'cancelAfterSeconds' => $this->cancelAfterSeconds,
-            ],
-            'ai_update_interval_seconds' => $this->aiUpdateIntervalSeconds,
-            'trade_logic_summary' => "The bot monitors the price of {$this->symbol} using {$this->klineInterval} klines. If the price deviates from its current reference price (initialPrice) by `triggerMarginPercent`, it attempts to place a Binance Convert Limit order. If price rises, it Sells {$this->convertBaseAsset}; if drops, it Buys {$this->convertBaseAsset} with {$this->convertQuoteAsset}. Order price has `orderPriceMarginPercent` slip. Orders auto-cancel after `cancelAfterSeconds`. Trade amount is `amountPercentage` of available balance. The AI can suggest a new 'initialPrice' (reference price) if market conditions change significantly.",
-        ];
+        $this->logger->debug("Collecting data for AI, including current balances.");
+        return \React\Promise\all([ // Use fully qualified name
+            'base_balance' => $this->getSpecificAssetBalance($this->convertBaseAsset),
+            'quote_balance' => $this->getSpecificAssetBalance($this->convertQuoteAsset)
+        ])->then(function (array $balances) {
+            $dataForAI = [
+                'current_asset_price' => $this->lastClosedKlinePrice ?? $this->initialPrice,
+                'current_balances' => [
+                    $this->convertBaseAsset => $balances['base_balance'],
+                    $this->convertQuoteAsset => $balances['quote_balance'],
+                ],
+                'recent_order_logs' => $this->recentOrderLogs,
+                'current_parameters' => [
+                    'initialPrice' => $this->initialPrice,
+                    'amountPercentage' => $this->amountPercentage,
+                    'triggerMarginPercent' => $this->triggerMarginPercent,
+                    'orderPriceMarginPercent' => $this->orderPriceMarginPercent,
+                    'cancelAfterSeconds' => $this->cancelAfterSeconds,
+                ],
+                'ai_update_interval_seconds' => $this->aiUpdateIntervalSeconds,
+                'trade_logic_summary' => "The bot monitors the price of {$this->symbol} using {$this->klineInterval} klines. If the price deviates from its current reference price (initialPrice) by `triggerMarginPercent`, it attempts to place a Binance Convert Limit order. If price rises, it Sells {$this->convertBaseAsset}; if drops, it Buys {$this->convertBaseAsset} with {$this->convertQuoteAsset}. Order price has `orderPriceMarginPercent` slip. Orders auto-cancel after `cancelAfterSeconds`. Trade amount is `amountPercentage` of available relevant asset balance. The AI can suggest a new 'initialPrice' (reference price) if market conditions change significantly.",
+            ];
+            $this->logger->debug("Data collected for AI", ['data_preview' => ['current_asset_price' => $dataForAI['current_asset_price'], 'current_balances' => $dataForAI['current_balances']]]);
+            return $dataForAI;
+        })->catch(function (\Throwable $e) {
+            $this->logger->error("Failed to collect data (balances) for AI.", ['exception' => $e->getMessage()]);
+            throw $e;
+        });
     }
 
     private function constructAIPrompt(array $dataForAI): string
     {
         $promptText = "You are an AI trading assistant. Your goal is to optimize the trading parameters for a cryptocurrency bot to maximize profit.\n\n";
         $promptText .= "Bot's Current State & Data:\n" . json_encode($dataForAI, JSON_PRETTY_PRINT) . "\n\n";
-        $promptText .= "Your Task:\nBased on the provided data, suggest new values for `initialPrice` (the reference price for triggers), `amountPercentage`, `triggerMarginPercent`, `orderPriceMarginPercent`, and `cancelAfterSeconds`.\n";
+        $promptText .= "Your Task:\nBased on the provided data (including `current_balances`), suggest new values for `initialPrice` (the reference price for triggers), `amountPercentage`, `triggerMarginPercent`, `orderPriceMarginPercent`, and `cancelAfterSeconds`.\n";
+        $promptText .= "The `amountPercentage` should consider the `current_balances` to ensure trades are feasible.\n";
         $promptText .= "If you believe the current `initialPrice` is still relevant, you can suggest the same value or omit it. A new `initialPrice` should be based on recent price action or perceived new support/resistance.\n";
         $promptText .= "Your suggestions should aim to make profitable trades.\n\n";
         $promptText .= "Constraints for `cancelAfterSeconds`:\n";
@@ -616,7 +636,7 @@ class AiTradingBot
         $promptText .= "{\n  \"initialPrice\": <float_value_or_null_if_no_change>,\n  \"amountPercentage\": <float_value_between_0.1_and_100.0>,\n  \"triggerMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"orderPriceMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"cancelAfterSeconds\": <integer_value>\n}\n";
         $promptText .= "Example (changing initialPrice):\n{\"initialPrice\": " . ($dataForAI['current_asset_price'] ?? '96000.0') . ", \"amountPercentage\": 15.0, \"triggerMarginPercent\": 0.05, \"orderPriceMarginPercent\": 0.03, \"cancelAfterSeconds\": " . ($this->aiUpdateIntervalSeconds + 120) . "}\n";
         $promptText .= "Example (keeping initialPrice):\n{\"amountPercentage\": 10.0, \"triggerMarginPercent\": 0.04, \"orderPriceMarginPercent\": 0.02, \"cancelAfterSeconds\": " . ($this->aiUpdateIntervalSeconds + 90) . "}\n\n";
-        $promptText .= "Analyze the recent trades and current market conditions (as inferred from price) to make your decision. Ensure the JSON is valid.";
+        $promptText .= "Analyze the recent trades, current asset price, and current balances to make your decision. Ensure the JSON is valid.";
 
         return json_encode(['contents' => [['parts' => [['text' => $promptText]]]]]);
     }
@@ -699,12 +719,11 @@ class AiTradingBot
     {
         $this->logger->info('Attempting to update bot parameters from AI.', ['new_params' => $newParams]);
         $updated = false;
-        $oldInitialPrice = $this->initialPrice; // Store old value for logging
+        $oldInitialPrice = $this->initialPrice;
 
-        // Update initialPrice (reference price)
         if (isset($newParams['initialPrice']) && is_numeric($newParams['initialPrice'])) {
             $val = (float)$newParams['initialPrice'];
-            if ($val > 0) { // Basic validation for price
+            if ($val > 0) {
                 $this->initialPrice = $val;
                 $this->logger->info('Updated reference price (initialPrice) from AI.', [
                     'old_reference_price' => $oldInitialPrice,
@@ -715,8 +734,7 @@ class AiTradingBot
                 $this->logger->warning('AI proposed invalid initialPrice (reference price)', ['value' => $val]);
             }
         } elseif (array_key_exists('initialPrice', $newParams) && $newParams['initialPrice'] === null) {
-            // AI explicitly said null, meaning no change to initialPrice
-            $this->logger->info('AI explicitly suggested no change to initialPrice (reference price).');
+            $this->logger->info('AI explicitly suggested no change to initialPrice (reference price). Kept: ' . $this->initialPrice);
         }
 
 
@@ -765,7 +783,6 @@ class AiTradingBot
         }
 
         if (!$updated && !(isset($newParams['initialPrice']) && is_numeric($newParams['initialPrice']))) {
-             // Log only if no parameters AT ALL were updated (including initialPrice)
             if (!array_key_exists('initialPrice', $newParams) || ($newParams['initialPrice'] !== null && !is_numeric($newParams['initialPrice']))) {
                  $this->logger->warning('No valid parameters were updated from AI response.');
             }
@@ -792,9 +809,9 @@ $bot = new AiTradingBot(
     triggerMarginPercent: 0.02,
     orderPriceMarginPercent: 0.01,
     orderCheckIntervalSeconds: 5,
-    cancelAfterSeconds: 660,
+    cancelAfterSeconds: 360,
     maxScriptRuntimeSeconds: 86400,
-    aiUpdateIntervalSeconds: 600
+    aiUpdateIntervalSeconds: 300
 );
 
 $bot->run();
