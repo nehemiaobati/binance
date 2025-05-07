@@ -11,6 +11,7 @@ use Ratchet\Client\WebSocket;
 use React\Http\Browser;
 use Psr\Http\Message\ResponseInterface;
 use React\Promise\PromiseInterface;
+use React\Promise\Deferred;
 use Monolog\Logger;
 use Monolog\Handler\StreamHandler;
 use Monolog\Formatter\LineFormatter;
@@ -18,8 +19,8 @@ use Monolog\Formatter\LineFormatter;
 // --- Configuration Loading ---
 $binanceApiKey = getenv('BINANCE_API_KEY') ?: 'NqgRju8D4Hqexr9ZBsbO0Ua4F2MiPzLshm7pCCBBGkbEgzj7yakorkadbPBX6UQF';
 $binanceApiSecret = getenv('BINANCE_API_SECRET') ?: 'ue8NGUVZMTTNT8FcgT0bgSuCR6AfoFtEbmxfK7nIjHbePuWNW07CreuNAul5Yjeg';
-$geminiApiKey = getenv('GEMINI_API_KEY') ?: 'AIzaSyChCv_Ab9Sd0vORDG-VY6rMrhKpMThv_YA'; // IMPORTANT: Set your Gemini API Key
-$geminiModelName = getenv('GEMINI_MODEL_NAME') ?: 'gemini-1.5-flash-latest'; // Configurable Gemini Model
+$geminiApiKey = getenv('GEMINI_API_KEY') ?: 'AIzaSyChCv_Ab9Sd0vORDG-VY6rMrhKpMThv_YA';
+$geminiModelName = getenv('GEMINI_MODEL_NAME') ?: 'gemini-1.5-flash-latest';
 
 if ($binanceApiKey === 'YOUR_DEFAULT_KEY_FALLBACK' || $binanceApiSecret === 'YOUR_DEFAULT_SECRET_FALLBACK') {
     die("Error: Binance API Key or Secret not configured. Please set BINANCE_API_KEY and BINANCE_API_SECRET environment variables.\n");
@@ -67,7 +68,7 @@ class AiTradingBot
     // --- State Properties ---
     private ?float $initialBaseBalance = null;
     private ?float $initialQuoteBalance = null;
-    private ?float $initialPrice = null;
+    private ?float $initialPrice = null; // This is the reference price, now AI-updatable
     private ?float $lastClosedKlinePrice = null;
     private ?string $activeOrderId = null;
     private ?array $activeOrderDetails = null;
@@ -149,7 +150,7 @@ class AiTradingBot
             function ($results) {
                 $this->initialBaseBalance = (float)$results[0];
                 $this->initialQuoteBalance = (float)$results[1];
-                $this->initialPrice = (float)$results[2];
+                $this->initialPrice = (float)$results[2]; // Sets the very first reference price
                 $this->lastClosedKlinePrice = $this->initialPrice;
 
                 if ($this->initialPrice === null || $this->initialPrice <= 0) {
@@ -158,7 +159,7 @@ class AiTradingBot
                 $this->logger->info('Initialization Success', [
                     'initial_' . $this->convertBaseAsset . '_balance' => $this->initialBaseBalance,
                     'initial_' . $this->convertQuoteAsset . '_balance' => $this->initialQuoteBalance,
-                    'initial_price_' . $this->symbol => $this->initialPrice,
+                    'initial_reference_price_' . $this->symbol => $this->initialPrice, // Logged as reference price
                 ]);
                 $this->connectWebSocket();
                 $this->setupTimers();
@@ -224,11 +225,9 @@ class AiTradingBot
         });
         $this->logger->info('Max runtime timer started', ['limit_seconds' => $this->maxScriptRuntimeSeconds]);
 
-        // AI Parameter Update Timer
         $this->loop->addPeriodicTimer($this->aiUpdateIntervalSeconds, [$this, 'triggerAIUpdate']);
         $this->logger->info('AI parameter update timer started', ['interval_seconds' => $this->aiUpdateIntervalSeconds]);
-        // Initial AI update after a short delay to let WS connect and gather initial data
-        $this->loop->addTimer(15, [$this, 'triggerAIUpdate']);
+        $this->loop->addTimer(60, [$this, 'triggerAIUpdate']);
     }
 
     private function handleWsMessage(string $msg): void
@@ -243,11 +242,12 @@ class AiTradingBot
         $currentPrice = (float)$data['k']['c'];
         $this->lastClosedKlinePrice = $currentPrice;
 
-        if ($this->initialPrice === null) {
-             $this->logger->warning('Initial price not set, cannot evaluate triggers from WS.');
+        if ($this->initialPrice === null) { // This is the reference price
+             $this->logger->warning('Reference price (initialPrice) not set, cannot evaluate triggers from WS.');
              return;
         }
 
+        // Use initialPrice (reference price) for triggering
         $triggerPriceUp = $this->initialPrice * (1 + $this->triggerMarginPercent / 100);
         $triggerPriceDown = $this->initialPrice * (1 - $this->triggerMarginPercent / 100);
         $orderSide = null;
@@ -256,10 +256,12 @@ class AiTradingBot
         elseif ($currentPrice <= $triggerPriceDown) $orderSide = $this->orderSideOnPriceDrop;
 
         if ($orderSide) {
-            $this->logger->info('Price trigger met', [
+            $this->logger->info('Price trigger met against reference price.', [
                 'current_price' => $currentPrice,
-                'trigger_up' => $triggerPriceUp,
-                'trigger_down' => $triggerPriceDown,
+                'reference_price' => $this->initialPrice,
+                'trigger_margin_percent' => $this->triggerMarginPercent,
+                'trigger_price_up' => $triggerPriceUp,
+                'trigger_price_down' => $triggerPriceDown,
                 'order_side' => $orderSide
             ]);
             $this->attemptPlaceOrder($orderSide, $currentPrice);
@@ -560,10 +562,10 @@ class AiTradingBot
     }
 
     // --- AI Interaction Methods ---
-    public function triggerAIUpdate(): void // Visibility changed to public
+    public function triggerAIUpdate(): void
     {
         if ($this->initialPrice === null) {
-            $this->logger->debug("AI Update: Initial price not set, skipping AI update cycle.");
+            $this->logger->debug("AI Update: Initial (reference) price not set, skipping AI update cycle.");
             return;
         }
         $this->logger->info('Starting AI parameter update cycle...');
@@ -572,12 +574,14 @@ class AiTradingBot
 
         $this->sendRequestToAI($promptPayload)
             ->then(
-                function ($rawResponse) { // Wrapped in a closure
+                function ($rawResponse) {
                     return $this->processAIResponse($rawResponse);
                 }
             )
             ->catch(function (\Throwable $e) {
-                $this->logger->error('AI update cycle failed.', ['exception' => $e->getMessage()]);
+                if (!($e->getCode() === 429)) {
+                    $this->logger->error('AI update cycle failed after processing or final attempt.', ['exception' => $e->getMessage()]);
+                }
             });
     }
 
@@ -587,13 +591,14 @@ class AiTradingBot
             'current_asset_price' => $this->lastClosedKlinePrice ?? $this->initialPrice,
             'recent_order_logs' => $this->recentOrderLogs,
             'current_parameters' => [
+                'initialPrice' => $this->initialPrice, // Current reference price
                 'amountPercentage' => $this->amountPercentage,
                 'triggerMarginPercent' => $this->triggerMarginPercent,
                 'orderPriceMarginPercent' => $this->orderPriceMarginPercent,
                 'cancelAfterSeconds' => $this->cancelAfterSeconds,
             ],
             'ai_update_interval_seconds' => $this->aiUpdateIntervalSeconds,
-            'trade_logic_summary' => "The bot monitors the price of {$this->symbol} using {$this->klineInterval} klines. If the price deviates from an initial reference price ({$this->initialPrice}) by `triggerMarginPercent`, it attempts to place a Binance Convert Limit order. If price rises, it Sells {$this->convertBaseAsset}; if drops, it Buys {$this->convertBaseAsset} with {$this->convertQuoteAsset}. Order price has `orderPriceMarginPercent` slip. Orders auto-cancel after `cancelAfterSeconds`. Trade amount is `amountPercentage` of available balance.",
+            'trade_logic_summary' => "The bot monitors the price of {$this->symbol} using {$this->klineInterval} klines. If the price deviates from its current reference price (initialPrice) by `triggerMarginPercent`, it attempts to place a Binance Convert Limit order. If price rises, it Sells {$this->convertBaseAsset}; if drops, it Buys {$this->convertBaseAsset} with {$this->convertQuoteAsset}. Order price has `orderPriceMarginPercent` slip. Orders auto-cancel after `cancelAfterSeconds`. Trade amount is `amountPercentage` of available balance. The AI can suggest a new 'initialPrice' (reference price) if market conditions change significantly.",
         ];
     }
 
@@ -601,14 +606,16 @@ class AiTradingBot
     {
         $promptText = "You are an AI trading assistant. Your goal is to optimize the trading parameters for a cryptocurrency bot to maximize profit.\n\n";
         $promptText .= "Bot's Current State & Data:\n" . json_encode($dataForAI, JSON_PRETTY_PRINT) . "\n\n";
-        $promptText .= "Your Task:\nBased on the provided data, suggest new values for `amountPercentage`, `triggerMarginPercent`, `orderPriceMarginPercent`, and `cancelAfterSeconds`.\n";
+        $promptText .= "Your Task:\nBased on the provided data, suggest new values for `initialPrice` (the reference price for triggers), `amountPercentage`, `triggerMarginPercent`, `orderPriceMarginPercent`, and `cancelAfterSeconds`.\n";
+        $promptText .= "If you believe the current `initialPrice` is still relevant, you can suggest the same value or omit it. A new `initialPrice` should be based on recent price action or perceived new support/resistance.\n";
         $promptText .= "Your suggestions should aim to make profitable trades.\n\n";
         $promptText .= "Constraints for `cancelAfterSeconds`:\n";
         $promptText .= "- The new `cancelAfterSeconds` value MUST be an integer.\n";
-        $promptText .= "- The new `cancelAfterSeconds` value MUST be strictly greater than `ai_update_interval_seconds` (which is {$this->aiUpdateIntervalSeconds}). For example, if `ai_update_interval_seconds` is {$this->aiUpdateIntervalSeconds}, `cancelAfterSeconds` must be at least " . ($this->aiUpdateIntervalSeconds + 1) . ".\n\n";
-        $promptText .= "Output Format:\nPlease provide your response as a single JSON object string with the following structure:\n";
-        $promptText .= "{\n  \"amountPercentage\": <float_value_between_0.1_and_100.0>,\n  \"triggerMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"orderPriceMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"cancelAfterSeconds\": <integer_value>\n}\n";
-        $promptText .= "Example:\n{\"amountPercentage\": 15.0, \"triggerMarginPercent\": 0.05, \"orderPriceMarginPercent\": 0.03, \"cancelAfterSeconds\": " . ($this->aiUpdateIntervalSeconds + 60) . "}\n\n";
+        $promptText .= "- The new `cancelAfterSeconds` value MUST be strictly greater than `ai_update_interval_seconds` (which is {$this->aiUpdateIntervalSeconds}).\n\n";
+        $promptText .= "Output Format:\nPlease provide your response as a single JSON object string with the following structure. You can omit `initialPrice` if no change is desired:\n";
+        $promptText .= "{\n  \"initialPrice\": <float_value_or_null_if_no_change>,\n  \"amountPercentage\": <float_value_between_0.1_and_100.0>,\n  \"triggerMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"orderPriceMarginPercent\": <float_value_between_0.01_and_5.0>,\n  \"cancelAfterSeconds\": <integer_value>\n}\n";
+        $promptText .= "Example (changing initialPrice):\n{\"initialPrice\": " . ($dataForAI['current_asset_price'] ?? '96000.0') . ", \"amountPercentage\": 15.0, \"triggerMarginPercent\": 0.05, \"orderPriceMarginPercent\": 0.03, \"cancelAfterSeconds\": " . ($this->aiUpdateIntervalSeconds + 120) . "}\n";
+        $promptText .= "Example (keeping initialPrice):\n{\"amountPercentage\": 10.0, \"triggerMarginPercent\": 0.04, \"orderPriceMarginPercent\": 0.02, \"cancelAfterSeconds\": " . ($this->aiUpdateIntervalSeconds + 90) . "}\n\n";
         $promptText .= "Analyze the recent trades and current market conditions (as inferred from price) to make your decision. Ensure the JSON is valid.";
 
         return json_encode(['contents' => [['parts' => [['text' => $promptText]]]]]);
@@ -620,23 +627,30 @@ class AiTradingBot
         $headers = [
             'Content-Type' => 'application/json',
         ];
-        $this->logger->debug('Sending request to Gemini AI', ['url' => $url, 'payload_preview' => substr($jsonPayload, 0, 250) . '...']);
+        $this->logger->debug('Sending request to Gemini AI', ['url' => $url, 'payload_preview' => substr($jsonPayload, 0, 100) . '...']);
 
         return $this->browser->post($url, $headers, $jsonPayload)->then(
             function (ResponseInterface $response) {
                 $body = (string)$response->getBody();
-                $this->logger->debug('Received response from Gemini AI', ['status' => $response->getStatusCode(), 'body_preview' => substr($body, 0, 500) . '...']);
+                $this->logger->debug('Received response from Gemini AI', ['status' => $response->getStatusCode(), 'body_preview' => substr($body, 0, 100) . '...']);
                 if ($response->getStatusCode() >= 300) {
-                    throw new \RuntimeException("Gemini API HTTP error: " . $response->getStatusCode() . " Body: " . $body);
+                    if ($response->getStatusCode() === 429) {
+                        $this->logger->error('Gemini API rate limit hit (429 Too Many Requests)');
+                        throw new \RuntimeException("HTTP status code 429 (Too Many Requests)", 429);
+                    }
+                    throw new \RuntimeException("Gemini API HTTP error: " . $response->getStatusCode() . " Body: " . substr($body, 0, 200));
                 }
                 return $body;
             },
             function (\Throwable $e) {
-                $this->logger->error('Gemini AI request failed', ['exception' => $e->getMessage()]);
+                if (!($e->getCode() === 429)) {
+                    $this->logger->error('Gemini AI request failed (Network/Client Error)', ['exception' => $e->getMessage()]);
+                }
                 throw $e;
             }
         );
     }
+
 
     private function processAIResponse(string $rawResponse): void
     {
@@ -649,7 +663,11 @@ class AiTradingBot
 
             $aiTextResponse = $responseDecoded['candidates'][0]['content']['parts'][0]['text'] ?? null;
             if (!$aiTextResponse) {
-                throw new \InvalidArgumentException("Could not extract text from AI response. Full response: " . substr($rawResponse,0,500));
+                if (isset($responseDecoded['generated_text'])) {
+                    $aiTextResponse = $responseDecoded['generated_text'];
+                } else {
+                    throw new \InvalidArgumentException("Could not extract text from AI response. Full response: " . substr($rawResponse,0,500));
+                }
             }
 
             $paramsJson = $aiTextResponse;
@@ -662,10 +680,10 @@ class AiTradingBot
             $newParams = json_decode($paramsJson, true);
             if (json_last_error() !== JSON_ERROR_NONE) {
                 $this->logger->error("Failed to decode JSON parameters from AI's text response.", [
-                    'ai_text_response' => $aiTextResponse,
+                    'ai_text_response_preview' => substr($aiTextResponse, 0, 200),
                     'json_error' => json_last_error_msg()
                 ]);
-                throw new \InvalidArgumentException("Failed to decode JSON parameters from AI's text: " . json_last_error_msg());
+                throw new \InvalidArgumentException("Failed to decode JSON parameters from AI's text: " . json_last_error_msg() . " - Input: " . substr($aiTextResponse,0,100));
             }
             $this->updateBotParameters($newParams);
 
@@ -681,6 +699,26 @@ class AiTradingBot
     {
         $this->logger->info('Attempting to update bot parameters from AI.', ['new_params' => $newParams]);
         $updated = false;
+        $oldInitialPrice = $this->initialPrice; // Store old value for logging
+
+        // Update initialPrice (reference price)
+        if (isset($newParams['initialPrice']) && is_numeric($newParams['initialPrice'])) {
+            $val = (float)$newParams['initialPrice'];
+            if ($val > 0) { // Basic validation for price
+                $this->initialPrice = $val;
+                $this->logger->info('Updated reference price (initialPrice) from AI.', [
+                    'old_reference_price' => $oldInitialPrice,
+                    'new_reference_price' => $this->initialPrice
+                ]);
+                $updated = true;
+            } else {
+                $this->logger->warning('AI proposed invalid initialPrice (reference price)', ['value' => $val]);
+            }
+        } elseif (array_key_exists('initialPrice', $newParams) && $newParams['initialPrice'] === null) {
+            // AI explicitly said null, meaning no change to initialPrice
+            $this->logger->info('AI explicitly suggested no change to initialPrice (reference price).');
+        }
+
 
         if (isset($newParams['amountPercentage']) && is_numeric($newParams['amountPercentage'])) {
             $val = (float)$newParams['amountPercentage'];
@@ -726,8 +764,11 @@ class AiTradingBot
             }
         }
 
-        if (!$updated) {
-            $this->logger->warning('No valid parameters were updated from AI response.');
+        if (!$updated && !(isset($newParams['initialPrice']) && is_numeric($newParams['initialPrice']))) {
+             // Log only if no parameters AT ALL were updated (including initialPrice)
+            if (!array_key_exists('initialPrice', $newParams) || ($newParams['initialPrice'] !== null && !is_numeric($newParams['initialPrice']))) {
+                 $this->logger->warning('No valid parameters were updated from AI response.');
+            }
         }
     }
 }
@@ -751,9 +792,9 @@ $bot = new AiTradingBot(
     triggerMarginPercent: 0.02,
     orderPriceMarginPercent: 0.01,
     orderCheckIntervalSeconds: 5,
-    cancelAfterSeconds: 360,
-    maxScriptRuntimeSeconds: 3 * 3600,
-    aiUpdateIntervalSeconds: 300
+    cancelAfterSeconds: 660,
+    maxScriptRuntimeSeconds: 86400,
+    aiUpdateIntervalSeconds: 600
 );
 
 $bot->run();
