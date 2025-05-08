@@ -85,6 +85,8 @@ class AiTradingBotFutures
     private bool $isPlacingOrManagingOrder = false; // General lock for complex operations
     private ?string $listenKey = null;
     private ?\React\EventLoop\TimerInterface $listenKeyRefreshTimer = null;
+    private bool $isMissingProtectiveOrder = false; // NEW: Flag if position open but SL/TP missing
+    private ?array $lastAIDecisionResult = null; // NEW: Store outcome of last AI action
 
     // AI Suggested Parameters (can be part of a more complex state object)
     private float $aiSuggestedEntryPrice;
@@ -186,6 +188,7 @@ class AiTradingBotFutures
                 $this->connectWebSocket();
                 $this->setupTimers();
                 $this->loop->addTimer(5, function () {
+                     // Initial AI check after startup
                     $this->triggerAIUpdate();
                 });
             },
@@ -239,90 +242,91 @@ class AiTradingBotFutures
                 $conn->on('message', fn($msg) => $this->handleWsMessage((string)$msg));
                 $conn->on('error', function (\Throwable $e) {
                     $this->logger->error('WebSocket error', ['exception_class' => get_class($e), 'exception' => $e->getMessage()]);
-                    $this->stop();
+                    $this->stop(); // Consider reconnect logic later
                 });
                 $conn->on('close', function ($code = null, $reason = null) {
                     $this->logger->warning('WebSocket connection closed', ['code' => $code, 'reason' => $reason]);
-                    $this->stop();
+                    $this->wsConnection = null; // Mark as disconnected
+                    $this->stop(); // Consider reconnect logic later
                 });
             },
             function (\Throwable $e) {
                 $this->logger->error('WebSocket connection failed', ['exception_class' => get_class($e), 'exception' => $e->getMessage()]);
-                $this->stop();
+                $this->stop(); // Consider reconnect logic later
             }
         );
     }
 
     private function setupTimers(): void
     {
+        // Fallback Order Check / Timeout Timer
         $this->loop->addPeriodicTimer($this->orderCheckIntervalSeconds, function () {
-            if ($this->activeEntryOrderId && !$this->isPlacingOrManagingOrder) {
-                // Check for timeout first
-                if ($this->activeEntryOrderTimestamp !== null &&
-                    (time() - $this->activeEntryOrderTimestamp) > $this->pendingEntryOrderCancelTimeoutSeconds) {
-                    
-                    $this->logger->warning("Pending entry order {$this->activeEntryOrderId} timed out after {$this->pendingEntryOrderCancelTimeoutSeconds} seconds. Attempting cancellation.");
-                    $this->isPlacingOrManagingOrder = true; // Lock during cancellation
-                    $orderIdToCancel = $this->activeEntryOrderId; 
-                    // Store AI params at time of order for logging, in case they change before log
-                    $timedOutOrderSide = $this->aiSuggestedSide;
-                    $timedOutOrderPrice = $this->aiSuggestedEntryPrice;
-                    $timedOutOrderQty = $this->aiSuggestedQuantity;
+            // --- Pending Entry Order Timeout Check ---
+            // This check only applies to ENTRY orders, not SL/TP
+            if ($this->activeEntryOrderId && !$this->isPlacingOrManagingOrder && $this->activeEntryOrderTimestamp !== null) {
+                $secondsPassed = time() - $this->activeEntryOrderTimestamp;
+                if ($secondsPassed > $this->pendingEntryOrderCancelTimeoutSeconds) {
+                    $this->logger->warning("Pending entry order {$this->activeEntryOrderId} timed out ({$secondsPassed}s > {$this->pendingEntryOrderCancelTimeoutSeconds}s). Attempting cancellation.");
+                    $this->isPlacingOrManagingOrder = true; // Lock
+                    $orderIdToCancel = $this->activeEntryOrderId;
+                    $timedOutOrderSide = $this->aiSuggestedSide ?? 'N/A'; // Capture state at time of decision
+                    $timedOutOrderPrice = $this->aiSuggestedEntryPrice ?? 0;
+                    $timedOutOrderQty = $this->aiSuggestedQuantity ?? 0;
 
-
+                    // Attempt cancellation
                     $this->cancelFuturesOrder($this->tradingSymbol, $orderIdToCancel)
                         ->then(
                             function ($cancellationData) use ($orderIdToCancel, $timedOutOrderSide, $timedOutOrderPrice, $timedOutOrderQty) {
                                 $this->logger->info("Pending entry order {$orderIdToCancel} successfully cancelled due to timeout.", ['response_status' => $cancellationData['status'] ?? 'N/A']);
-                                // The ORDER_TRADE_UPDATE event for CANCELED status should primarily handle resetting state.
-                                // This is a fallback/confirmation.
-                                if ($this->activeEntryOrderId === $orderIdToCancel) { 
-                                     $this->addOrderToLog(
-                                        $orderIdToCancel,
-                                        'CANCELED_TIMEOUT', 
-                                        $timedOutOrderSide,
-                                        $this->tradingSymbol,
-                                        $timedOutOrderPrice,
-                                        $timedOutOrderQty,
-                                        $this->marginAsset,
-                                        time(),
-                                        0.0 
-                                    );
-                                    $this->resetTradeState(); 
+                                // State reset primarily handled by ORDER_TRADE_UPDATE(CANCELED), but good fallback.
+                                if ($this->activeEntryOrderId === $orderIdToCancel) {
+                                    $this->addOrderToLog($orderIdToCancel, 'CANCELED_TIMEOUT', $timedOutOrderSide, $this->tradingSymbol, $timedOutOrderPrice, $timedOutOrderQty, $this->marginAsset, time(), 0.0);
+                                    $this->resetTradeState();
+                                    $this->lastAIDecisionResult = ['status' => 'INFO', 'message' => "Entry order {$orderIdToCancel} cancelled due to timeout.", 'decision' => null];
                                 }
                             },
                             function (\Throwable $e) use ($orderIdToCancel) {
-                                $this->logger->error("Failed to cancel timed-out pending entry order {$orderIdToCancel}.", ['exception' => $e->getMessage()]);
-                                // If cancellation fails, it might have filled or been cancelled just before.
-                                // The regular checkActiveOrderStatus or WS events will eventually pick it up.
+                                $this->logger->error("Failed attempt to cancel timed-out pending entry order {$orderIdToCancel}.", ['exception' => $e->getMessage()]);
+                                // If cancellation fails (e.g., -2011 order not found), it might have filled or already been cancelled.
+                                // We rely on WS or the subsequent status check to potentially catch the final state.
+                                // If it's still the active order internally, check its status again.
                                 if ($this->activeEntryOrderId === $orderIdToCancel) {
                                      $this->checkActiveOrderStatus($orderIdToCancel, 'ENTRY_TIMEOUT_CANCEL_FAILED');
                                 }
+                                $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Failed cancellation attempt for timed-out order {$orderIdToCancel}.", 'decision' => null];
                             }
-                        )
-                        ->finally(function () {
-                            $this->isPlacingOrManagingOrder = false;
+                        )->finally(function () {
+                            $this->isPlacingOrManagingOrder = false; // Unlock
                         });
-                } else {
-                    // If not timed out, perform the regular status check
-                    $this->checkActiveOrderStatus($this->activeEntryOrderId, 'ENTRY');
+                    return; // Don't proceed to regular status check if timeout cancellation was attempted
                 }
             }
+
+            // --- Regular Status Check (if no timeout occurred) ---
+            if ($this->activeEntryOrderId && !$this->isPlacingOrManagingOrder) {
+                $this->checkActiveOrderStatus($this->activeEntryOrderId, 'ENTRY');
+            }
+            // NOTE: We don't routinely check SL/TP status here because their state changes (FILL/CANCEL)
+            // are critical events expected to come through the User Data Stream immediately.
+            // Checking them periodically adds API calls and complexity for less benefit than the entry check.
+            // The "missing protective order" state handles potential issues there.
         });
         $this->logger->info('Fallback order check timer started', ['interval_seconds' => $this->orderCheckIntervalSeconds, 'entry_order_timeout' => $this->pendingEntryOrderCancelTimeoutSeconds]);
 
-
+        // Max Runtime Timer
         $this->loop->addTimer($this->maxScriptRuntimeSeconds, function () {
             $this->logger->warning('Maximum script runtime reached. Stopping.', ['max_runtime_seconds' => $this->maxScriptRuntimeSeconds]);
             $this->stop();
         });
         $this->logger->info('Max runtime timer started', ['limit_seconds' => $this->maxScriptRuntimeSeconds]);
 
+        // AI Update Timer
         $this->loop->addPeriodicTimer($this->aiUpdateIntervalSeconds, function () {
             $this->triggerAIUpdate();
         });
         $this->logger->info('AI parameter update timer started', ['interval_seconds' => $this->aiUpdateIntervalSeconds]);
 
+        // Listen Key Refresh Timer
         if ($this->listenKey) {
             $this->listenKeyRefreshTimer = $this->loop->addPeriodicTimer(self::LISTEN_KEY_REFRESH_INTERVAL, function () {
                 if ($this->listenKey) {
@@ -367,34 +371,30 @@ class AiTradingBotFutures
 
         switch ($eventType) {
             case 'ACCOUNT_UPDATE':
+                // Handle position changes from ACCOUNT_UPDATE (e.g., liquidation, ADL)
                 if (isset($eventData['a']['P'])) {
                     foreach($eventData['a']['P'] as $posData) {
                         if ($posData['s'] === $this->tradingSymbol) {
-                            $oldUnrealizedPnl = $this->currentPositionDetails['unrealizedPnl'] ?? 0;
-                            $newPositionDetails = $this->formatPositionDetails($posData); 
-                            if ($newPositionDetails) {
+                            $oldPositionDetails = $this->currentPositionDetails;
+                            $newPositionDetails = $this->formatPositionDetails($posData);
+
+                            if ($newPositionDetails && !$oldPositionDetails) {
+                                $this->logger->info("Position opened/updated via ACCOUNT_UPDATE.", $newPositionDetails);
                                 $this->currentPositionDetails = $newPositionDetails;
-                                $this->logger->info("Position update from ACCOUNT_UPDATE", [
-                                    'symbol' => $this->tradingSymbol,
-                                    'amount' => $posData['pa'],
-                                    'entry_price' => $posData['ep'],
-                                    'unrealized_pnl' => $posData['up'],
-                                    'old_unrealized_pnl' => $oldUnrealizedPnl
-                                ]);
-                            } else {
-                                $currentQty = $this->currentPositionDetails['quantity'] ?? 0;
-                                if ((float)$posData['pa'] == 0 && (float)$currentQty != 0) {
-                                     $this->logger->info("Position for {$this->tradingSymbol} detected as closed via ACCOUNT_UPDATE (amount is zero).", [
-                                        'reason_code' => $posData['cr'] ?? 'N/A'
-                                    ]);
-                                    $this->handlePositionClosed();
-                                } else {
-                                     $this->logger->debug("Received ACCOUNT_UPDATE for zero position, no action needed.", ['symbol' => $this->tradingSymbol]);
-                                }
+                                // If position appears but we thought we had no SL/TP, maybe flag? Unlikely needed.
+                            } elseif (!$newPositionDetails && $oldPositionDetails) {
+                                $this->logger->info("Position for {$this->tradingSymbol} detected as closed via ACCOUNT_UPDATE.", ['reason_code' => $posData['cr'] ?? 'N/A']);
+                                $this->handlePositionClosed(); // Will attempt to cancel any lingering SL/TP known to the bot
+                            } elseif ($newPositionDetails && $oldPositionDetails) {
+                                // Update existing position details (like PnL)
+                                $this->currentPositionDetails = $newPositionDetails;
+                                $this->logger->debug("Position details updated via ACCOUNT_UPDATE.", $newPositionDetails);
                             }
+                            // else: no change (e.g., update for other symbol, or zero position update)
                         }
                     }
                 }
+                // Handle balance changes
                 if (isset($eventData['a']['B'])) {
                      foreach($eventData['a']['B'] as $balData) {
                          if ($balData['a'] === $this->marginAsset) {
@@ -422,79 +422,94 @@ class AiTradingBotFutures
                 $orderId = (string)$order['i'];
                 $orderStatus = $order['X'];
 
+                // --- Entry Order Update ---
                 if ($orderId === $this->activeEntryOrderId) {
-                    if ($orderStatus === 'FILLED' || $orderStatus === 'PARTIALLY_FILLED') {
+                    if (in_array($orderStatus, ['FILLED', 'PARTIALLY_FILLED'])) {
+                        // Update position details based on fill
                         $filledQty = (float)$order['z'];
                         $avgFilledPrice = (float)$order['ap'];
-                        if (!$this->currentPositionDetails || (float)($this->currentPositionDetails['quantity'] ?? 0) == 0) {
+                        $isFirstFill = !$this->currentPositionDetails || (float)($this->currentPositionDetails['quantity'] ?? 0) == 0;
+
+                        if ($isFirstFill) {
                              $this->currentPositionDetails = [
                                 'symbol' => $this->tradingSymbol,
                                 'side' => $order['S'] === 'BUY' ? 'LONG' : 'SHORT',
                                 'entryPrice' => $avgFilledPrice,
                                 'quantity' => $filledQty,
-                                'leverage' => $this->aiSuggestedLeverage,
+                                'leverage' => $this->aiSuggestedLeverage, // Assume leverage set correctly before order
                                 'markPrice' => $avgFilledPrice,
                                 'unrealizedPnl' => 0
                             ];
-                            $this->logger->info("Entry order (partially/fully) filled. Updated position.", $this->currentPositionDetails);
+                             $this->logger->info("Entry order first fill. Updated position.", $this->currentPositionDetails);
                         } else {
+                             // Handle averaging down/up if partial fills happen (though less common for futures entry)
                              $existingQty = (float)$this->currentPositionDetails['quantity'];
                              $existingEntry = (float)$this->currentPositionDetails['entryPrice'];
                              $this->currentPositionDetails['entryPrice'] = (($existingEntry * $existingQty) + ($avgFilledPrice * $filledQty)) / ($existingQty + $filledQty);
                              $this->currentPositionDetails['quantity'] = $existingQty + $filledQty;
-                             $this->logger->info("Entry order increased existing position.", $this->currentPositionDetails);
+                             $this->logger->info("Entry order partial fill increased position.", $this->currentPositionDetails);
                         }
 
-
+                        // If fully filled, clear entry state and place SL/TP
                         if ($orderStatus === 'FILLED') {
                             $this->logger->info("Entry order fully filled: {$this->activeEntryOrderId}. Placing SL/TP orders.");
-                            $this->activeEntryOrderId = null; 
-                            $this->activeEntryOrderTimestamp = null; // Clear timestamp on fill
-                            $this->placeSlAndTpOrders();
+                            $this->activeEntryOrderId = null;
+                            $this->activeEntryOrderTimestamp = null;
+                            $this->isMissingProtectiveOrder = false; // Reset flag on successful entry
+                            $this->placeSlAndTpOrders(); // This will set isPlacingOrManagingOrder = true
                         }
-                    } elseif (in_array($orderStatus, ['CANCELED', 'EXPIRED', 'REJECTED', 'NEW_INSURANCE', 'NEW_ADL'])) {
+                    } elseif (in_array($orderStatus, ['CANCELED', 'EXPIRED', 'REJECTED'])) {
                         $this->logger->warning("Active entry order {$this->activeEntryOrderId} ended without fill via WS: {$orderStatus}. Resetting.");
-                        $this->addOrderToLog(
-                            $orderId, $orderStatus, $order['S'], $this->tradingSymbol,
-                            (float)$order['p'], (float)$order['q'], $this->marginAsset, time(), (float)($order['rp'] ?? 0)
-                        );
-                        $this->resetTradeState(); // This clears activeEntryOrderId and activeEntryOrderTimestamp
+                        $this->addOrderToLog($orderId, $orderStatus, $order['S'], $this->tradingSymbol, (float)$order['p'], (float)$order['q'], $this->marginAsset, time(), (float)($order['rp'] ?? 0));
+                        $this->resetTradeState();
+                         $this->lastAIDecisionResult = ['status' => 'INFO', 'message' => "Entry order {$orderId} ended without fill: {$orderStatus}.", 'decision' => null];
                     }
-                } elseif ($orderId === $this->activeSlOrderId || $orderId === $this->activeTpOrderId) {
+                }
+                // --- SL/TP Order Update ---
+                elseif ($orderId === $this->activeSlOrderId || $orderId === $this->activeTpOrderId) {
                     if ($orderStatus === 'FILLED') {
+                        $isSlFill = ($orderId === $this->activeSlOrderId);
+                        $otherOrderId = $isSlFill ? $this->activeTpOrderId : $this->activeSlOrderId;
                         $logSide = 'UNKNOWN';
-                        if ($this->currentPositionDetails && isset($this->currentPositionDetails['side'])) {
+                        if ($this->currentPositionDetails) {
                              $logSide = ($this->currentPositionDetails['side'] === 'LONG' ? 'SELL' : 'BUY');
                         }
-                        $this->logger->info("{$order['ot']} order {$orderId} (SL/TP) filled. Position closed.", [
-                            'realized_pnl' => $order['rp'] ?? 'N/A'
-                        ]);
-                        $this->addOrderToLog(
-                            $orderId, $orderStatus, $logSide,
-                            $this->tradingSymbol, (float)($order['ap'] > 0 ? $order['ap'] : $order['sp']), (float)$order['z'],
-                            $this->marginAsset, time(), (float)($order['rp'] ?? 0)
-                        );
-                        $this->handlePositionClosed($orderId === $this->activeSlOrderId ? $this->activeTpOrderId : $this->activeSlOrderId);
+                        $this->logger->info("{$order['ot']} order {$orderId} (SL/TP) filled. Position closed.", ['realized_pnl' => $order['rp'] ?? 'N/A']);
+                        $this->addOrderToLog($orderId, $orderStatus, $logSide, $this->tradingSymbol, (float)($order['ap'] > 0 ? $order['ap'] : ($order['sp'] ?? 0)), (float)$order['z'], $this->marginAsset, time(), (float)($order['rp'] ?? 0));
+                        $this->handlePositionClosed($otherOrderId); // Pass the other order ID to be cancelled
+                        $this->lastAIDecisionResult = ['status' => 'INFO', 'message' => "Position closed by " . ($isSlFill ? "SL" : "TP") . " order {$orderId}.", 'decision' => null];
+
                     } elseif (in_array($orderStatus, ['CANCELED', 'EXPIRED', 'REJECTED'])) {
-                         $this->logger->warning("SL/TP order {$orderId} ended without fill: {$orderStatus}. This might be due to manual cancellation or other logic.");
+                         $this->logger->warning("SL/TP order {$orderId} ended without fill: {$orderStatus}. Possible external cancellation or issue.");
                          if ($orderId === $this->activeSlOrderId) $this->activeSlOrderId = null;
                          if ($orderId === $this->activeTpOrderId) $this->activeTpOrderId = null;
+
+                         // If position still exists but now missing potentially both SL/TP
                          if ($this->currentPositionDetails && !$this->activeSlOrderId && !$this->activeTpOrderId) {
-                              $this->logger->warning("Position open but SL/TP orders are gone unexpectedly. Triggering AI.");
-                              $this->triggerAIUpdate(true); 
+                              $this->logger->critical("Position open but BOTH SL/TP orders are now gone unexpectedly. Flagging critical state.");
+                              $this->isMissingProtectiveOrder = true;
+                              $this->lastAIDecisionResult = ['status' => 'CRITICAL', 'message' => "Position unprotected: SL/TP order {$orderId} ended with status {$orderStatus}.", 'decision' => null];
+                              $this->triggerAIUpdate(true); // Emergency check
+                         } elseif ($this->currentPositionDetails && (!$this->activeSlOrderId || !$this->activeTpOrderId)) {
+                             $this->logger->warning("Position open but ONE SL/TP order is now gone unexpectedly. Flagging potentially unsafe state.");
+                              $this->isMissingProtectiveOrder = true; // Flag state
+                              $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "Position missing one protective order: {$orderId} ended with status {$orderStatus}.", 'decision' => null];
+                              $this->triggerAIUpdate(true); // Ask AI what to do
                          }
                     }
                 }
-                break;
+                break; // End ORDER_TRADE_UPDATE
+
             case 'listenKeyExpired':
                 $this->logger->warning("ListenKey expired. Attempting to get a new one and reconnect WebSocket.");
                 $this->listenKey = null;
-                if ($this->wsConnection) $this->wsConnection->close();
+                if ($this->wsConnection) { try { $this->wsConnection->close(); } catch (\Exception $_){}}
+                $this->wsConnection = null;
                 $this->startUserDataStream()->then(function ($data) {
                     $this->listenKey = $data['listenKey'] ?? null;
                     if ($this->listenKey) {
                         $this->logger->info("New ListenKey obtained. Reconnecting WebSocket.");
-                        $this->connectWebSocket();
+                        $this->connectWebSocket(); // Reconnect logic
                     } else {
                         $this->logger->error("Failed to get new ListenKey after expiry.");
                         $this->stop();
@@ -504,10 +519,14 @@ class AiTradingBotFutures
                      $this->stop();
                 });
                 break;
+
             case 'MARGIN_CALL':
                 $this->logger->critical("MARGIN CALL RECEIVED!", $eventData['m'] ?? $eventData);
-                $this->triggerAIUpdate(true);
+                $this->isMissingProtectiveOrder = true; // Treat margin call as critical state
+                $this->lastAIDecisionResult = ['status' => 'CRITICAL', 'message' => "MARGIN CALL RECEIVED!", 'decision' => null];
+                $this->triggerAIUpdate(true); // Emergency trigger
                 break;
+
             default:
                 $this->logger->debug('Unhandled user data event type', ['type' => $eventType]);
         }
@@ -517,72 +536,88 @@ class AiTradingBotFutures
     {
         if (empty($positionsInput)) return null;
         $positionData = null;
-        if (isset($positionsInput['symbol']) && isset($positionsInput['positionAmt'])) {
-             if ($positionsInput['symbol'] === $this->tradingSymbol && (float)($positionsInput['positionAmt'] ?? $positionsInput['pa'] ?? 0) != 0) {
+        $isSingleObject = !isset($positionsInput[0]) && isset($positionsInput['symbol']);
+
+        if ($isSingleObject) {
+            $currentQty = (float)($positionsInput['positionAmt'] ?? $positionsInput['pa'] ?? 0);
+            if ($positionsInput['symbol'] === $this->tradingSymbol && $currentQty != 0) {
                 $positionData = $positionsInput;
-             }
-        }
-        else if (is_array($positionsInput) && isset($positionsInput[0]['symbol'])) {
+            }
+        } elseif (is_array($positionsInput) && isset($positionsInput[0]['symbol'])) {
             foreach ($positionsInput as $p) {
-                if (isset($p['symbol']) && $p['symbol'] === $this->tradingSymbol && (float)($p['positionAmt'] ?? $p['pa'] ?? 0) != 0) {
+                $currentQty = (float)($p['positionAmt'] ?? $p['pa'] ?? 0);
+                if (isset($p['symbol']) && $p['symbol'] === $this->tradingSymbol && $currentQty != 0) {
                     $positionData = $p;
                     break;
                 }
             }
         }
         if (!$positionData) return null;
-        $quantity = (float)($positionData['positionAmt'] ?? $positionData['pa'] ?? 0);
-        $entryPrice = (float)($positionData['entryPrice'] ?? $positionData['ep'] ?? 0);
-        $markPrice = (float)($positionData['markPrice'] ?? $positionData['mp'] ?? ($this->lastClosedKlinePrice ?? 0) );
-        $unrealizedPnl = (float)($positionData['unrealizedProfit'] ?? $positionData['up'] ?? 0);
-        $leverage = (int)($positionData['leverage'] ?? 0);
-        $side = $quantity > 0 ? 'LONG' : ($quantity < 0 ? 'SHORT' : 'NONE');
-        if ($side === 'NONE') return null;
+
+        $quantityVal = (float)($positionData['positionAmt'] ?? $positionData['pa'] ?? 0);
+        $entryPriceVal = (float)($positionData['entryPrice'] ?? $positionData['ep'] ?? 0);
+        $markPriceVal = (float)($positionData['markPrice'] ?? $positionData['mp'] ?? ($this->lastClosedKlinePrice ?? 0));
+        $unrealizedPnlVal = (float)($positionData['unrealizedProfit'] ?? $positionData['up'] ?? 0);
+        $leverageVal = (int)($positionData['leverage'] ?? $this->defaultLeverage); // Use default if not provided
+        $initialMarginVal = (float)($positionData['initialMargin'] ?? $positionData['iw'] ?? 0);
+        $maintMarginVal = (float)($positionData['maintMargin'] ?? 0);
+        $isolatedWalletVal = (float)($positionData['isolatedWallet'] ?? 0);
+
+        if ($quantityVal == 0) return null;
+        $side = $quantityVal > 0 ? 'LONG' : 'SHORT';
 
         return [
             'symbol' => $this->tradingSymbol,
             'side' => $side,
-            'entryPrice' => $entryPrice,
-            'quantity' => abs($quantity),
-            'leverage' => $leverage ?: $this->aiSuggestedLeverage,
-            'markPrice' => $markPrice,
-            'unrealizedPnl' => $unrealizedPnl,
-            'initialMargin' => (float)($positionData['initialMargin'] ?? $positionData['iw'] ?? 0),
-            'maintMargin' => (float)($positionData['maintMargin'] ?? 0),
-            'isolatedWallet' => (float)($positionData['isolatedWallet'] ?? 0),
+            'entryPrice' => $entryPriceVal,
+            'quantity' => abs($quantityVal),
+            'leverage' => $leverageVal ?: $this->defaultLeverage, // Fallback again just in case
+            'markPrice' => $markPriceVal,
+            'unrealizedPnl' => $unrealizedPnlVal,
+            'initialMargin' => $initialMarginVal,
+            'maintMargin' => $maintMarginVal,
+            'isolatedWallet' => $isolatedWalletVal,
         ];
     }
 
     private function placeSlAndTpOrders(): void
     {
-        if (!$this->currentPositionDetails || $this->isPlacingOrManagingOrder) {
-            $this->logger->warning("Cannot place SL/TP: No current position or operation in progress.");
+        if (!$this->currentPositionDetails) {
+            $this->logger->error("Attempted to place SL/TP orders without a current position.");
             return;
         }
+         if ($this->isPlacingOrManagingOrder) {
+             $this->logger->warning("SL/TP placement already in progress, skipping.");
+             return;
+         }
         $this->isPlacingOrManagingOrder = true;
+        $this->isMissingProtectiveOrder = false; // Assume success initially
 
         $positionSide = $this->currentPositionDetails['side'];
         $quantity = (float)$this->currentPositionDetails['quantity'];
         $orderSideForSlTp = ($positionSide === 'LONG') ? 'SELL' : 'BUY';
 
+        // Ensure AI parameters are valid before attempting placement
+        if ($this->aiSuggestedSlPrice <= 0 || $this->aiSuggestedTpPrice <= 0) {
+             $this->logger->critical("Invalid AI SL/TP prices during placement attempt.", ['sl' => $this->aiSuggestedSlPrice, 'tp' => $this->aiSuggestedTpPrice]);
+             $this->isMissingProtectiveOrder = true;
+             $this->isPlacingOrManagingOrder = false;
+             $this->lastAIDecisionResult = ['status' => 'CRITICAL', 'message' => "Invalid SL/TP prices detected at placement time.", 'decision' => null];
+             $this->triggerAIUpdate(true); // Ask AI to handle this critical state
+             return;
+        }
+
+
         $slOrderPromise = $this->placeFuturesStopMarketOrder(
-            $this->tradingSymbol,
-            $orderSideForSlTp,
-            $quantity,
-            $this->aiSuggestedSlPrice,
-            true
+            $this->tradingSymbol, $orderSideForSlTp, $quantity, $this->aiSuggestedSlPrice, true
         )->then(function ($orderData) {
             $this->activeSlOrderId = (string)$orderData['orderId'];
             $this->logger->info("Stop Loss order placed.", ['orderId' => $this->activeSlOrderId, 'stopPrice' => $this->aiSuggestedSlPrice]);
-            return $orderData;
+            return $orderData; // Pass data for potential logging in catch
         });
 
         $tpOrderPromise = $this->placeFuturesTakeProfitMarketOrder(
-            $this->tradingSymbol,
-            $orderSideForSlTp,
-            $quantity,
-            $this->aiSuggestedTpPrice,
-            true
+            $this->tradingSymbol, $orderSideForSlTp, $quantity, $this->aiSuggestedTpPrice, true
         )->then(function ($orderData) {
             $this->activeTpOrderId = (string)$orderData['orderId'];
             $this->logger->info("Take Profit order placed.", ['orderId' => $this->activeTpOrderId, 'stopPrice' => $this->aiSuggestedTpPrice]);
@@ -591,18 +626,33 @@ class AiTradingBotFutures
 
         \React\Promise\all([$slOrderPromise, $tpOrderPromise])
             ->then(
-                function () {
-                    $this->logger->info("SL and TP orders successfully placed.");
+                function (array $results) {
+                    // Both SL and TP were placed successfully according to the API response
+                    $this->logger->info("SL and TP orders successfully placed via API.", [
+                        'sl_order_id' => $results[0]['orderId'] ?? 'N/A',
+                        'tp_order_id' => $results[1]['orderId'] ?? 'N/A'
+                        ]);
+                    // State ($activeSlOrderId, $activeTpOrderId) was set in the individual 'then' blocks above
+                    $this->isMissingProtectiveOrder = false; // Confirm state is good
                     $this->isPlacingOrManagingOrder = false;
+                     $this->lastAIDecisionResult = ['status' => 'OK', 'message' => "SL/TP orders placed successfully.", 'decision' => null]; // Update status
                 },
                 function (\Throwable $e) {
-                    $this->logger->error("Error placing SL/TP orders. Manual intervention may be needed.", [
-                        'exception_class' => get_class($e), 'exception' => $e->getMessage(),
-                        'sl_order_id' => $this->activeSlOrderId, 'tp_order_id' => $this->activeTpOrderId
+                    // One or both of the SL/TP placements failed
+                    $this->logger->critical("CRITICAL: Error placing one or both SL/TP orders. Position might be unprotected!", [
+                        'exception_class' => get_class($e),
+                        'exception' => $e->getMessage(),
+                        'current_sl_id_state' => $this->activeSlOrderId, // ID might be set if one succeeded before the other failed
+                        'current_tp_id_state' => $this->activeTpOrderId,
+                        'position_details' => $this->currentPositionDetails
                     ]);
-                    if ($this->activeSlOrderId && !$this->activeTpOrderId) $this->cancelFuturesOrder($this->tradingSymbol, $this->activeSlOrderId);
-                    if ($this->activeTpOrderId && !$this->activeSlOrderId) $this->cancelFuturesOrder($this->tradingSymbol, $this->activeTpOrderId);
+                    // --- MODIFIED LOGIC ---
+                    // Do NOT cancel the order that might have succeeded.
+                    // Flag the critical state instead.
+                    $this->isMissingProtectiveOrder = true;
                     $this->isPlacingOrManagingOrder = false;
+                    // Trigger AI immediately to assess the situation (e.g., close the unprotected position)
+                     $this->lastAIDecisionResult = ['status' => 'CRITICAL', 'message' => "Failed placing SL/TP orders. Position potentially unprotected.", 'decision' => null];
                     $this->triggerAIUpdate(true);
                 }
             );
@@ -610,24 +660,39 @@ class AiTradingBotFutures
 
     private function handlePositionClosed(?string $otherOrderIdToCancel = null): void
     {
-        $this->logger->info("Position closed for {$this->tradingSymbol}. Resetting state.");
+        $closedPositionDetails = $this->currentPositionDetails; // Log details before resetting
+        $this->logger->info("Position closed action triggered for {$this->tradingSymbol}.", ['details_before_reset' => $closedPositionDetails]);
+
+        // Attempt to cancel the other SL/TP order if provided
         if ($otherOrderIdToCancel) {
             $this->cancelFuturesOrder($this->tradingSymbol, $otherOrderIdToCancel)->then(
-                fn() => $this->logger->info("Successfully cancelled other SL/TP order: {$otherOrderIdToCancel}"),
-                fn($e) => $this->logger->error("Failed to cancel other SL/TP order: {$otherOrderIdToCancel}", ['err' => $e->getMessage()])
+                fn() => $this->logger->info("Successfully cancelled remaining SL/TP order: {$otherOrderIdToCancel} during position close."),
+                function ($e) use ($otherOrderIdToCancel) {
+                    // If cancel fails, it might be -2011 (already filled/cancelled) - this is usually OK.
+                     if (!str_contains($e->getMessage(), '-2011')) {
+                         $this->logger->error("Failed to cancel remaining SL/TP order: {$otherOrderIdToCancel} during position close.", ['err' => $e->getMessage()]);
+                     } else {
+                         $this->logger->info("Attempt to cancel remaining SL/TP order {$otherOrderIdToCancel} failed (likely already resolved).", ['err_preview' => substr($e->getMessage(),0,50)]);
+                     }
+                }
             );
         } else {
-            if ($this->activeSlOrderId) {
-                $this->cancelFuturesOrder($this->tradingSymbol, $this->activeSlOrderId);
-                $this->logger->info("Attempting to cancel active SL order: {$this->activeSlOrderId}");
-            }
-            if ($this->activeTpOrderId) {
-                $this->cancelFuturesOrder($this->tradingSymbol, $this->activeTpOrderId);
-                 $this->logger->info("Attempting to cancel active TP order: {$this->activeTpOrderId}");
+            // If no specific other order provided, try cancelling any known active SL/TP (e.g., if closed via ACCOUNT_UPDATE)
+            $cancelPromises = [];
+            if ($this->activeSlOrderId) $cancelPromises[] = $this->cancelFuturesOrder($this->tradingSymbol, $this->activeSlOrderId);
+            if ($this->activeTpOrderId) $cancelPromises[] = $this->cancelFuturesOrder($this->tradingSymbol, $this->activeTpOrderId);
+            if (!empty($cancelPromises)) {
+                \React\Promise\all($cancelPromises)->then(
+                     fn() => $this->logger->info("Attempted cancellation of any known active SL/TP orders during position close."),
+                     fn($e) => $this->logger->warning("Error during blanket cancellation of SL/TP orders on position close (might be normal if already resolved).", ['err' => $e->getMessage()])
+                );
             }
         }
-        $this->resetTradeState();
-        $this->loop->addTimer(10, function () {
+
+        $this->resetTradeState(); // Crucial: Resets all position/order state variables
+
+        // Trigger AI update after a short delay to allow state to settle and potentially get final balance updates
+        $this->loop->addTimer(5, function () {
             $this->triggerAIUpdate();
         });
     }
@@ -635,11 +700,13 @@ class AiTradingBotFutures
     private function resetTradeState(): void {
         $this->logger->info("Resetting trade state.");
         $this->activeEntryOrderId = null;
-        $this->activeEntryOrderTimestamp = null; // Reset timestamp
+        $this->activeEntryOrderTimestamp = null;
         $this->activeSlOrderId = null;
         $this->activeTpOrderId = null;
         $this->currentPositionDetails = null;
         $this->isPlacingOrManagingOrder = false;
+        $this->isMissingProtectiveOrder = false; // Reset flag
+        // Keep $lastAIDecisionResult for the next prompt, don't reset it here.
     }
 
     private function addOrderToLog(string $orderId, string $status, string $side, string $assetPair, ?float $limitPrice, ?float $amountUsed, ?string $amountAsset, int $timestamp, ?float $realizedPnl): void
@@ -664,21 +731,34 @@ class AiTradingBotFutures
     {
         if ($this->currentPositionDetails || $this->activeEntryOrderId || $this->isPlacingOrManagingOrder) {
             $this->logger->debug('Skipping position opening: existing position, active entry order, or operation in progress.');
+             $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => 'Skipped OPEN_POSITION: Already in position or pending entry.', 'decision' => null]; // Update status
             return;
         }
 
-        // Basic check if AI parameters are even set (values themselves will be validated before sending to exchange API)
+        // Basic check if AI parameters are even set
         if (!isset($this->aiSuggestedEntryPrice, $this->aiSuggestedSlPrice, $this->aiSuggestedTpPrice, $this->aiSuggestedQuantity, $this->aiSuggestedSide, $this->aiSuggestedLeverage)) {
             $this->logger->warning('AI parameters for opening position are not fully set. Waiting for AI update.');
+            $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => 'Skipped OPEN_POSITION: AI parameters not fully set.', 'decision' => null];
             return;
         }
-        
+         // Final check for positive values before attempting API calls
+        if ($this->aiSuggestedEntryPrice <= 0 || $this->aiSuggestedQuantity <= 0 || $this->aiSuggestedSlPrice <=0 || $this->aiSuggestedTpPrice <= 0) {
+            $this->logger->error("Cannot attempt open position: one or more critical AI parameters are zero/negative.", [
+                 'entry' => $this->aiSuggestedEntryPrice, 'qty' => $this->aiSuggestedQuantity, 'sl' => $this->aiSuggestedSlPrice, 'tp' => $this->aiSuggestedTpPrice
+            ]);
+            $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => 'Rejected OPEN_POSITION: Invalid parameters (zero/negative).', 'decision' => ['action' => 'OPEN_POSITION']]; // Simplified decision log
+            return;
+        }
+
+
         $this->isPlacingOrManagingOrder = true;
-        $this->logger->info('Attempting to open new position based on AI (values will be formatted before sending).', [
-            'side' => $this->aiSuggestedSide, 'quantity_raw' => $this->aiSuggestedQuantity,
-            'entry_raw' => $this->aiSuggestedEntryPrice, 'sl_raw' => $this->aiSuggestedSlPrice, 'tp_raw' => $this->aiSuggestedTpPrice,
+        $aiParamsForLog = [
+            'side' => $this->aiSuggestedSide, 'quantity' => $this->aiSuggestedQuantity,
+            'entry' => $this->aiSuggestedEntryPrice, 'sl' => $this->aiSuggestedSlPrice, 'tp' => $this->aiSuggestedTpPrice,
             'leverage' => $this->aiSuggestedLeverage
-        ]);
+        ];
+        $this->logger->info('Attempting to open new position based on AI.', $aiParamsForLog);
+
 
         $this->setLeverage($this->tradingSymbol, $this->aiSuggestedLeverage)
             ->then(function () {
@@ -689,36 +769,43 @@ class AiTradingBotFutures
                     $this->aiSuggestedEntryPrice
                 );
             })
-            ->then(function ($orderData) {
+            ->then(function ($orderData) use ($aiParamsForLog) {
                 $this->activeEntryOrderId = (string)$orderData['orderId'];
-                $this->activeEntryOrderTimestamp = time(); // Set timestamp here
+                $this->activeEntryOrderTimestamp = time();
                 $this->logger->info("Entry limit order placed successfully.", [
                     'orderId' => $this->activeEntryOrderId,
                     'clientOrderId' => $orderData['clientOrderId'],
                     'placement_timestamp' => date('Y-m-d H:i:s', $this->activeEntryOrderTimestamp)
                 ]);
+                 $this->lastAIDecisionResult = ['status' => 'OK', 'message' => "Placed entry order {$this->activeEntryOrderId}.", 'decision' => ['action' => 'OPEN_POSITION'] + $aiParamsForLog];
                 $this->isPlacingOrManagingOrder = false;
             })
-            ->catch(function (\Throwable $e) {
+            ->catch(function (\Throwable $e) use ($aiParamsForLog) {
                 $this->logger->error('Failed to open position.', [
                     'exception_class' => get_class($e), 'exception' => $e->getMessage(),
-                    'ai_params_raw' => [
-                        'side' => $this->aiSuggestedSide ?? 'N/A', 'qty' => $this->aiSuggestedQuantity ?? 'N/A',
-                        'entry' => $this->aiSuggestedEntryPrice ?? 'N/A'
-                    ]
+                    'ai_params' => $aiParamsForLog
                 ]);
+                 $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Failed to place entry order: " . $e->getMessage(), 'decision' => ['action' => 'OPEN_POSITION'] + $aiParamsForLog];
                 $this->isPlacingOrManagingOrder = false;
-                $this->resetTradeState();
+                $this->resetTradeState(); // Reset state on failure
             });
     }
     private function attemptClosePositionByAI(): void
     {
-        if (!$this->currentPositionDetails || $this->isPlacingOrManagingOrder) {
-            $this->logger->debug('Skipping AI close: No position or operation in progress.');
+        if (!$this->currentPositionDetails) {
+            $this->logger->debug('Skipping AI close: No position exists.');
+            $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => 'Skipped CLOSE_POSITION: No position exists.', 'decision' => null];
             return;
         }
+         if ($this->isPlacingOrManagingOrder){
+             $this->logger->debug('Skipping AI close: Operation already in progress.');
+             $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => 'Skipped CLOSE_POSITION: Operation in progress.', 'decision' => null];
+             return;
+         }
+
         $this->isPlacingOrManagingOrder = true;
-        $this->logger->info("AI requests to close current position for {$this->tradingSymbol} at market.");
+        $positionToClose = $this->currentPositionDetails; // Capture details before potential modification
+        $this->logger->info("AI requests to close current position for {$this->tradingSymbol} at market.", ['position' => $positionToClose]);
 
         $cancellationPromises = [];
         if ($this->activeSlOrderId) {
@@ -731,24 +818,34 @@ class AiTradingBotFutures
                 ->then(fn() => $this->logger->info("TP Order {$this->activeTpOrderId} cancelled for AI close."))
                 ->otherwise(fn($e) => $this->logger->error("Failed to cancel TP {$this->activeTpOrderId} for AI close.", ['err' => $e->getMessage()]));
         }
+        // Clear internal IDs immediately after attempting cancellation
+        $slIdCancelled = $this->activeSlOrderId;
+        $tpIdCancelled = $this->activeTpOrderId;
         $this->activeSlOrderId = null;
         $this->activeTpOrderId = null;
 
-
-        \React\Promise\all($cancellationPromises)->then(function() {
-            $closeSide = $this->currentPositionDetails['side'] === 'LONG' ? 'SELL' : 'BUY';
-            $quantityToClose = $this->currentPositionDetails['quantity'];
-
-            return $this->placeFuturesMarketOrder($this->tradingSymbol, $closeSide, $quantityToClose, true);
-        })->then(function($closeOrderData) {
+        \React\Promise\all($cancellationPromises)->then(function() use ($positionToClose) {
+            $closeSide = $positionToClose['side'] === 'LONG' ? 'SELL' : 'BUY';
+            $quantityToClose = $positionToClose['quantity'];
+            $this->logger->info("Attempting to place market order to close position.", ['side' => $closeSide, 'quantity' => $quantityToClose]);
+            return $this->placeFuturesMarketOrder($this->tradingSymbol, $closeSide, $quantityToClose, true); // reduceOnly = true
+        })->then(function($closeOrderData) use ($positionToClose, $slIdCancelled, $tpIdCancelled) {
             $this->logger->info("Market order placed by AI to close position.", [
                 'orderId' => $closeOrderData['orderId'],
                 'status' => $closeOrderData['status']
             ]);
-        })->catch(function(\Throwable $e) {
-            $this->logger->error("Error during AI-driven position close.", ['exception' => $e->getMessage()]);
+             // Position closure confirmation and state reset happens via WS ORDER_TRADE_UPDATE(FILLED) -> handlePositionClosed
+            $this->lastAIDecisionResult = ['status' => 'OK', 'message' => "Placed market close order {$closeOrderData['orderId']}.", 'decision' => ['action' => 'CLOSE_POSITION', 'cancelled_sl' => $slIdCancelled, 'cancelled_tp' => $tpIdCancelled]];
+            // DO NOT reset state here; wait for the fill event.
+        })->catch(function(\Throwable $e) use ($positionToClose) {
+            $this->logger->error("Error during AI-driven position close process.", ['exception' => $e->getMessage(), 'position' => $positionToClose]);
+            // State might be inconsistent here (SL/TP potentially cancelled but close failed).
+            // Triggering AI might be best fallback.
+            $this->isMissingProtectiveOrder = true; // Assume potentially unsafe state
+            $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Error during AI close: " . $e->getMessage(), 'decision' => ['action' => 'CLOSE_POSITION']];
+            $this->triggerAIUpdate(true);
         })->finally(function() {
-            $this->isPlacingOrManagingOrder = false;
+            $this->isPlacingOrManagingOrder = false; // Unlock managing flag
         });
     }
 
@@ -760,7 +857,6 @@ class AiTradingBotFutures
         $params['timestamp'] = $timestamp;
         $params['recvWindow'] = self::BINANCE_API_RECV_WINDOW;
 
-
         ksort($params);
         $queryString = http_build_query($params, '', '&', PHP_QUERY_RFC3986);
         $signature = hash_hmac('sha256', $queryString, $this->binanceApiSecret);
@@ -770,7 +866,7 @@ class AiTradingBotFutures
 
         if ($method === 'GET') {
             $url .= '?' . $queryString . '&signature=' . $signature;
-        } else { 
+        } else {
             $bodyParamsWithSignature = $params;
             $bodyParamsWithSignature['signature'] = $signature;
             $body = http_build_query($bodyParamsWithSignature, '', '&', PHP_QUERY_RFC3986);
@@ -801,12 +897,13 @@ class AiTradingBotFutures
                     $this->logger->error('Failed to decode API JSON response', $logCtx + ['json_err' => json_last_error_msg(), 'body_preview' => substr($body, 0, 200)]);
                     throw new \RuntimeException("JSON decode error: " . json_last_error_msg() . " for " . $url . ". Response body: " . substr($body,0,200) );
                 }
-                if (isset($data['code']) && (int)$data['code'] < 0 && (int)$data['code'] !== -2011 ) {
+                if (isset($data['code']) && (int)$data['code'] < 0 && (int)$data['code'] !== -2011 ) { // Ignore -2011 'Order does not exist' for cancels primarily
                     $this->logger->error('Binance Futures API Error', $logCtx + ['api_code' => $data['code'], 'api_msg' => $data['msg'] ?? 'N/A']);
                     throw new \RuntimeException("Binance Futures API error ({$data['code']}): " . ($data['msg'] ?? 'Unknown error') . " for " . $url);
                 }
-                if ($statusCode >= 400 && !(isset($data['code']) && (int)$data['code'] < 0) && !(isset($data['code']) && (int)$data['code'] == -2011) ) {
-                     $this->logger->error('HTTP Error Status without specific handled API error', $logCtx + ['body_preview' => substr($body, 0, 200)]);
+                 // Allow 2xx status codes OR -2011 error code for specific cases like duplicate cancels
+                if ($statusCode >= 300 && !(isset($data['code']) && (int)$data['code'] == -2011)) {
+                     $this->logger->error('HTTP Error Status received from API', $logCtx + ['api_code' => $data['code'] ?? 'N/A', 'api_msg' => $data['msg'] ?? 'N/A', 'body_preview' => substr($body, 0, 200)]);
                      throw new \RuntimeException("HTTP error {$statusCode} for " . $url . ". Body: " . substr($body,0,200));
                 }
                 return $data;
@@ -830,17 +927,16 @@ class AiTradingBotFutures
         );
     }
 
-
-    private function getPricePrecisionFormat(): string { return '%.1f'; }
-    private function getQuantityPrecisionFormat(): string { return '%.3f'; }
-
+    // --- Specific Binance Futures API Methods (using precision formatters) ---
+    private function getPricePrecisionFormat(): string { return '%.1f'; } // BTCUSDT
+    private function getQuantityPrecisionFormat(): string { return '%.3f'; } // BTCUSDT
 
     private function getFuturesAccountBalance(): PromiseInterface {
         $endpoint = '/fapi/v2/balance';
         $signedRequestData = $this->createSignedRequestData($endpoint, [], 'GET');
         return $this->makeAsyncApiRequest('GET', $signedRequestData['url'], $signedRequestData['headers'])
             ->then(function ($data) {
-                if (!is_array($data)) throw new \RuntimeException("Invalid response for getFuturesAccountBalance: not an array.");
+                 if (!is_array($data)) throw new \RuntimeException("Invalid response for getFuturesAccountBalance: not an array.");
                 $balances = [];
                 foreach ($data as $assetInfo) {
                     if (isset($assetInfo['asset'], $assetInfo['balance'], $assetInfo['availableBalance'])) {
@@ -860,8 +956,8 @@ class AiTradingBotFutures
         $params = ['symbol' => strtoupper($symbol), 'interval' => $interval, 'limit' => 1];
         $url = $this->currentRestApiBaseUrl . $endpoint . '?' . http_build_query($params);
         return $this->makeAsyncApiRequest('GET', $url, [], null, true)
-            ->then(function ($data) {
-                if (!is_array($data) || empty($data) || !isset($data[0][4])) throw new \RuntimeException("Invalid klines response format.");
+             ->then(function ($data) {
+                 if (!is_array($data) || empty($data) || !isset($data[0][4])) throw new \RuntimeException("Invalid klines response format.");
                 $price = (float)$data[0][4];
                 if ($price <=0) throw new \RuntimeException("Invalid kline price: {$price}");
                 return ['price' => $price, 'timestamp' => (int)$data[0][0]];
@@ -869,15 +965,11 @@ class AiTradingBotFutures
     }
 
     private function getHistoricalKlines(string $symbol, string $interval, int $limit = 100): PromiseInterface {
-        $endpoint = '/fapi/v1/klines'; 
-        $params = [
-            'symbol' => strtoupper($symbol),
-            'interval' => $interval,
-            'limit' => $limit
-        ];
+        $endpoint = '/fapi/v1/klines';
+        $params = ['symbol' => strtoupper($symbol), 'interval' => $interval, 'limit' => $limit];
         $url = $this->currentRestApiBaseUrl . $endpoint . '?' . http_build_query($params);
         $this->logger->debug("Fetching historical klines", ['symbol' => $symbol, 'interval' => $interval, 'limit' => $limit]);
-        return $this->makeAsyncApiRequest('GET', $url, [], null, true) 
+        return $this->makeAsyncApiRequest('GET', $url, [], null, true)
             ->then(function ($data) use ($symbol, $interval, $limit){
                 if (!is_array($data)) {
                     $this->logger->warning("Invalid historical klines response format, expected array.", ['symbol' => $symbol]);
@@ -885,23 +977,14 @@ class AiTradingBotFutures
                 }
                 $formattedKlines = array_map(function($kline) {
                     if (count($kline) >= 6) {
-                        return [
-                            'openTime' => (int)$kline[0], 
-                            'open' => (string)$kline[1],
-                            'high' => (string)$kline[2],
-                            'low' => (string)$kline[3],
-                            'close' => (string)$kline[4],
-                            'volume' => (string)$kline[5],
-                        ];
-                    }
-                    return null;
+                        return ['openTime' => (int)$kline[0], 'open' => (string)$kline[1], 'high' => (string)$kline[2], 'low' => (string)$kline[3], 'close' => (string)$kline[4], 'volume' => (string)$kline[5]];
+                    } return null;
                 }, $data);
-                $formattedKlines = array_filter($formattedKlines); 
+                $formattedKlines = array_filter($formattedKlines);
                 $this->logger->debug("Fetched historical klines successfully", ['symbol' => $symbol, 'count' => count($formattedKlines)]);
                 return $formattedKlines;
             });
     }
-
 
     private function getPositionInformation(string $symbol): PromiseInterface {
         $endpoint = '/fapi/v2/positionRisk';
@@ -909,7 +992,7 @@ class AiTradingBotFutures
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'GET');
         return $this->makeAsyncApiRequest('GET', $signedRequestData['url'], $signedRequestData['headers'])
             ->then(function ($data) {
-                if (!is_array($data)) throw new \RuntimeException("Invalid response for getPositionInformation: not an array.");
+                 if (!is_array($data)) throw new \RuntimeException("Invalid response for getPositionInformation: not an array.");
                 $positionToReturn = null;
                 if (is_array($data) && !empty($data) && isset($data[0]['symbol'])) {
                      foreach ($data as $pos) {
@@ -919,17 +1002,14 @@ class AiTradingBotFutures
                         }
                     }
                 }
-
                 if ($positionToReturn) {
                     $this->logger->debug("Fetched position information for {$this->tradingSymbol}", ['position_data_preview' => substr(json_encode($positionToReturn),0,100)]);
                     return $positionToReturn;
                 }
-
-                $this->logger->info("No active position found for {$this->tradingSymbol} via getPositionInformation.");
+                $this->logger->debug("No active position found for {$this->tradingSymbol} via getPositionInformation."); // Changed to debug
                 return null;
             });
     }
-
 
     private function setLeverage(string $symbol, int $leverage): PromiseInterface {
         $endpoint = '/fapi/v1/leverage';
@@ -937,7 +1017,7 @@ class AiTradingBotFutures
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData'])
              ->then(function ($data) use ($symbol, $leverage) {
-                $this->logger->info("Leverage set for {$symbol}", ['leverage' => $data['leverage'] ?? $leverage, 'response' => $data]);
+                 $this->logger->info("Leverage set attempt result for {$symbol}", ['requested' => $leverage, 'response' => $data]);
                 return $data;
             });
     }
@@ -946,48 +1026,35 @@ class AiTradingBotFutures
         $endpoint = '/fapi/v1/order';
         if ($price <= 0 || $quantity <= 0) return \React\Promise\reject(new \InvalidArgumentException("Invalid price/quantity for limit order. P:{$price} Q:{$quantity}"));
         $params = [
-            'symbol' => strtoupper($symbol),
-            'side' => strtoupper($side),
-            'positionSide' => strtoupper($positionSide),
-            'type' => 'LIMIT',
-            'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
-            'price' => sprintf($this->getPricePrecisionFormat(), $price),
-            'timeInForce' => $timeInForce,
+            'symbol' => strtoupper($symbol), 'side' => strtoupper($side), 'positionSide' => strtoupper($positionSide),
+            'type' => 'LIMIT', 'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
+            'price' => sprintf($this->getPricePrecisionFormat(), $price), 'timeInForce' => $timeInForce,
         ];
         if ($reduceOnly) $params['reduceOnly'] = 'true';
-
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
     }
+
     private function placeFuturesMarketOrder(string $symbol, string $side, float $quantity, ?bool $reduceOnly = false, ?string $positionSide = 'BOTH'): PromiseInterface {
         $endpoint = '/fapi/v1/order';
         if ($quantity <= 0) return \React\Promise\reject(new \InvalidArgumentException("Invalid quantity for market order. Q:{$quantity}"));
         $params = [
-            'symbol' => strtoupper($symbol),
-            'side' => strtoupper($side),
-            'positionSide' => strtoupper($positionSide),
-            'type' => 'MARKET',
-            'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
+            'symbol' => strtoupper($symbol), 'side' => strtoupper($side), 'positionSide' => strtoupper($positionSide),
+            'type' => 'MARKET', 'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
         ];
         if ($reduceOnly) $params['reduceOnly'] = 'true';
-
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
     }
-
 
     private function placeFuturesStopMarketOrder(string $symbol, string $side, float $quantity, float $stopPrice, bool $reduceOnly = true, ?string $positionSide = 'BOTH'): PromiseInterface {
         $endpoint = '/fapi/v1/order';
         if ($stopPrice <= 0 || $quantity <= 0) return \React\Promise\reject(new \InvalidArgumentException("Invalid stopPrice/quantity for STOP_MARKET. SP:{$stopPrice} Q:{$quantity}"));
         $params = [
-            'symbol' => strtoupper($symbol),
-            'side' => strtoupper($side),
-            'positionSide' => strtoupper($positionSide),
-            'type' => 'STOP_MARKET',
-            'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity), 
-            'stopPrice' => sprintf($this->getPricePrecisionFormat(), $stopPrice), 
-            'reduceOnly' => $reduceOnly ? 'true' : 'false',
-            'workingType' => 'MARK_PRICE'
+            'symbol' => strtoupper($symbol), 'side' => strtoupper($side), 'positionSide' => strtoupper($positionSide),
+            'type' => 'STOP_MARKET', 'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
+            'stopPrice' => sprintf($this->getPricePrecisionFormat(), $stopPrice),
+            'reduceOnly' => $reduceOnly ? 'true' : 'false', 'workingType' => 'MARK_PRICE'
         ];
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
@@ -997,14 +1064,10 @@ class AiTradingBotFutures
         $endpoint = '/fapi/v1/order';
          if ($stopPrice <= 0 || $quantity <= 0) return \React\Promise\reject(new \InvalidArgumentException("Invalid stopPrice/quantity for TAKE_PROFIT_MARKET. SP:{$stopPrice} Q:{$quantity}"));
         $params = [
-            'symbol' => strtoupper($symbol),
-            'side' => strtoupper($side),
-            'positionSide' => strtoupper($positionSide),
-            'type' => 'TAKE_PROFIT_MARKET',
-            'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity), 
-            'stopPrice' => sprintf($this->getPricePrecisionFormat(), $stopPrice), 
-            'reduceOnly' => $reduceOnly ? 'true' : 'false',
-            'workingType' => 'MARK_PRICE'
+            'symbol' => strtoupper($symbol), 'side' => strtoupper($side), 'positionSide' => strtoupper($positionSide),
+            'type' => 'TAKE_PROFIT_MARKET', 'quantity' => sprintf($this->getQuantityPrecisionFormat(), $quantity),
+            'stopPrice' => sprintf($this->getPricePrecisionFormat(), $stopPrice),
+            'reduceOnly' => $reduceOnly ? 'true' : 'false', 'workingType' => 'MARK_PRICE'
         ];
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
@@ -1020,33 +1083,60 @@ class AiTradingBotFutures
     private function checkActiveOrderStatus(string $orderId, string $orderTypeLabel): void {
         $this->getFuturesOrderStatus($this->tradingSymbol, $orderId)
         ->then(function (array $orderStatusData) use ($orderId, $orderTypeLabel) {
-            $this->logger->debug("Checked {$orderTypeLabel} order status (fallback)", [
-                'orderId' => $orderId, 'status' => $orderStatusData['status'] ?? 'UNKNOWN'
-            ]);
-             if ($orderTypeLabel === 'ENTRY' && $this->activeEntryOrderId === $orderId) {
-                 $status = $orderStatusData['status'] ?? null;
+            $status = $orderStatusData['status'] ?? 'UNKNOWN';
+            $this->logger->debug("Checked {$orderTypeLabel} order status (fallback)", ['orderId' => $orderId, 'status' => $status]);
+
+             // Fallback check specifically for ENTRY orders that might have been missed by WS
+             if (($orderTypeLabel === 'ENTRY' || $orderTypeLabel === 'ENTRY_TIMEOUT_CANCEL_FAILED') && $this->activeEntryOrderId === $orderId) {
                  if (in_array($status, ['CANCELED', 'EXPIRED', 'REJECTED'])) {
-                     $this->logger->warning("Active entry order {$orderId} found as {$status} by fallback check. Resetting.");
+                     $this->logger->warning("Active entry order {$orderId} found as {$status} by fallback check. Resetting state via fallback.");
                      $this->addOrderToLog($orderId, $status, $orderStatusData['side'] ?? 'N/A', $this->tradingSymbol, (float)($orderStatusData['price'] ?? 0), (float)($orderStatusData['origQty'] ?? 0), $this->marginAsset, time(), (float)($orderStatusData['realizedPnl'] ?? 0));
                      $this->resetTradeState();
+                     $this->lastAIDecisionResult = ['status' => 'INFO', 'message' => "Entry order {$orderId} found {$status} via fallback.", 'decision' => null];
                  } elseif ($status === 'FILLED') {
-                     $this->logger->info("Active entry order {$orderId} found as FILLED by fallback check. WS should handle, but logging.");
+                      // This is tricky. If WS missed the fill, we don't have the AI's SL/TP params readily available here
+                      // to place the protective orders. The safest fallback is probably to flag the critical state.
+                     $this->logger->critical("CRITICAL FALLBACK: Active entry order {$orderId} found as FILLED by fallback check, but WS likely missed it. Position potentially unprotected!");
+                     $this->isMissingProtectiveOrder = true;
+                     $this->activeEntryOrderId = null; // Mark entry as done
+                     $this->activeEntryOrderTimestamp = null;
+                      // Update position details based on this order data if possible
+                     $filledQty = (float)($orderStatusData['executedQty'] ?? 0);
+                     $avgFilledPrice = (float)($orderStatusData['avgPrice'] ?? 0);
+                     if ($filledQty > 0 && $avgFilledPrice > 0) {
+                         $this->currentPositionDetails = [
+                            'symbol' => $this->tradingSymbol,
+                            'side' => $orderStatusData['side'] === 'BUY' ? 'LONG' : 'SHORT',
+                            'entryPrice' => $avgFilledPrice, 'quantity' => $filledQty,
+                            'leverage' => $this->currentPositionDetails['leverage'] ?? $this->defaultLeverage, // Try to preserve leverage if known
+                            'markPrice' => $avgFilledPrice, 'unrealizedPnl' => 0 ];
+                         $this->logger->info("Position details updated from fallback FILLED check.", $this->currentPositionDetails);
+                     } else {
+                         $this->logger->error("Could not update position details from fallback FILLED check due to missing data.", ['order_data' => $orderStatusData]);
+                     }
+
+                     $this->lastAIDecisionResult = ['status' => 'CRITICAL', 'message' => "Entry order {$orderId} found FILLED via fallback (WS missed?). Protective orders NOT placed.", 'decision' => null];
+                     $this->triggerAIUpdate(true); // Ask AI to close the now-unprotected position
                  }
+                 // else: Still NEW or PARTIALLY_FILLED, WS should handle transitions.
              }
+             // No explicit fallback check for SL/TP status here, rely on WS or `isMissingProtectiveOrder` state.
         })
         ->catch(function (\Throwable $e) use ($orderId, $orderTypeLabel) {
+            // Handle -2013 Order does not exist
             if (str_contains($e->getMessage(), '-2013') || stripos($e->getMessage(), 'Order does not exist') !== false) {
                 $this->logger->info("{$orderTypeLabel} order {$orderId} not found on check (likely resolved or never existed).", ['err_preview' => substr($e->getMessage(),0,100)]);
-                 if ($orderTypeLabel === 'ENTRY' && $this->activeEntryOrderId === $orderId) {
-                    $this->logger->warning("Active entry order {$orderId} disappeared from exchange. Resetting state.");
+                 if (($orderTypeLabel === 'ENTRY' || $orderTypeLabel === 'ENTRY_TIMEOUT_CANCEL_FAILED') && $this->activeEntryOrderId === $orderId) {
+                    $this->logger->warning("Active entry order {$orderId} disappeared from exchange according to fallback check. Resetting state.");
                     $this->resetTradeState();
+                     $this->lastAIDecisionResult = ['status' => 'INFO', 'message' => "Entry order {$orderId} not found via fallback.", 'decision' => null];
                  }
+                 // If an SL/TP order disappears, the WS check for missing orders should catch it if position still exists.
             } else {
                 $this->logger->error("Failed to get {$orderTypeLabel} order status (fallback).", ['orderId' => $orderId, 'exception' => $e->getMessage()]);
             }
         });
     }
-
 
     private function cancelFuturesOrder(string $symbol, string $orderId): PromiseInterface {
         $endpoint = '/fapi/v1/order';
@@ -1054,9 +1144,10 @@ class AiTradingBotFutures
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'DELETE');
         return $this->makeAsyncApiRequest('DELETE', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData'])
             ->then(function($data) use ($orderId){
-                $this->logger->info("Cancel order request processed for {$orderId}", ['response_status' => $data['status'] ?? 'N/A']);
+                $this->logger->info("Cancel order request processed for {$orderId}", ['response_status' => $data['status'] ?? 'N/A', 'response_orderId' => $data['orderId'] ?? 'N/A']);
                 return $data;
             });
+            // Catch is handled by the caller (e.g., handlePositionClosed, timeout logic)
     }
 
     private function getFuturesTradeHistory(string $symbol, int $limit = 50): PromiseInterface {
@@ -1064,28 +1155,30 @@ class AiTradingBotFutures
         $params = ['symbol' => strtoupper($symbol), 'limit' => $limit];
         $signedRequestData = $this->createSignedRequestData($endpoint, $params, 'GET');
         return $this->makeAsyncApiRequest('GET', $signedRequestData['url'], $signedRequestData['headers'])
-            ->then(function($data) use ($symbol) { 
+            ->then(function($data) use ($symbol) {
                 $this->logger->debug("Fetched recent futures trades for {$symbol}", ['count' => is_array($data) ? count($data) : 'N/A']);
                 return $data;
             });
     }
 
-
-    // User Data Stream ListenKey Management
+    // --- User Data Stream ListenKey Management ---
     private function startUserDataStream(): PromiseInterface {
         $endpoint = '/fapi/v1/listenKey';
+        // POST request requires no parameters other than signature/timestamp/recvWindow in the body
         $signedRequestData = $this->createSignedRequestData($endpoint, [], 'POST');
         return $this->makeAsyncApiRequest('POST', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
     }
 
     private function keepAliveUserDataStream(string $listenKey): PromiseInterface {
         $endpoint = '/fapi/v1/listenKey';
+        // PUT request requires listenKey parameter
         $signedRequestData = $this->createSignedRequestData($endpoint, ['listenKey' => $listenKey], 'PUT');
         return $this->makeAsyncApiRequest('PUT', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
     }
 
     private function closeUserDataStream(string $listenKey): PromiseInterface {
         $endpoint = '/fapi/v1/listenKey';
+        // DELETE request requires listenKey parameter
         $signedRequestData = $this->createSignedRequestData($endpoint, ['listenKey' => $listenKey], 'DELETE');
         return $this->makeAsyncApiRequest('DELETE', $signedRequestData['url'], $signedRequestData['headers'], $signedRequestData['postData']);
     }
@@ -1111,8 +1204,11 @@ class AiTradingBotFutures
                 }
             )
             ->catch(function (\Throwable $e) {
-                if ($e->getCode() !== 429) {
+                if ($e->getCode() !== 429) { // Don't log error for expected rate limit
                     $this->logger->error('AI update cycle failed.', ['exception_class' => get_class($e), 'exception' => $e->getMessage()]);
+                    $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "AI update cycle failed: " . $e->getMessage(), 'decision' => null];
+                } else {
+                     $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "AI rate limit hit.", 'decision' => null];
                 }
             });
     }
@@ -1120,38 +1216,69 @@ class AiTradingBotFutures
     private function collectDataForAI(): PromiseInterface
     {
         $this->logger->debug("Collecting data for AI...");
-        $historicalKlineLimit = 100; 
+        $historicalKlineLimit = 100;
 
-        return \React\Promise\all([
+        // Fetch fresh data
+        $promises = [
             'balance' => $this->getFuturesAccountBalance(),
-            'position' => $this->getPositionInformation($this->tradingSymbol),
+            'position' => $this->getPositionInformation($this->tradingSymbol), // Fetch latest position info
             'trade_history' => $this->getFuturesTradeHistory($this->tradingSymbol, 10),
-            'historical_klines' => $this->getHistoricalKlines($this->tradingSymbol, $this->klineInterval, $historicalKlineLimit) 
-        ])->then(function (array $results) {
+            'historical_klines' => $this->getHistoricalKlines($this->tradingSymbol, $this->klineInterval, $historicalKlineLimit)
+        ];
+
+        return \React\Promise\all($promises)->then(function (array $results) {
+            // Process results and update internal state *before* sending to AI if needed
+            // For example, update currentPositionDetails based on the fresh API call
+            $this->currentPositionDetails = $this->formatPositionDetails($results['position']); // Update based on latest API data
+
+            // Now build the data structure for the AI prompt using the potentially updated state
             $currentBalanceInfo = $results['balance'][$this->marginAsset] ?? ['availableBalance' => 0.0];
-            $currentPositionRaw = $results['position']; 
+            $currentPositionRaw = $results['position']; // Send raw data from API as well
 
             $activeEntryOrderDetails = null;
             if($this->activeEntryOrderId && $this->activeEntryOrderTimestamp) {
+                 $secondsPending = time() - $this->activeEntryOrderTimestamp;
+                 $timeoutIn = max(0, $this->pendingEntryOrderCancelTimeoutSeconds - $secondsPending); // Ensure non-negative
                 $activeEntryOrderDetails = [
                     'orderId' => $this->activeEntryOrderId,
                     'placedAt' => date('Y-m-d H:i:s', $this->activeEntryOrderTimestamp),
-                    'side' => $this->aiSuggestedSide, 
-                    'price' => $this->aiSuggestedEntryPrice,
-                    'quantity' => $this->aiSuggestedQuantity,
-                    'seconds_pending' => time() - $this->activeEntryOrderTimestamp,
-                    'timeout_in' => $this->pendingEntryOrderCancelTimeoutSeconds - (time() - $this->activeEntryOrderTimestamp)
+                    // Fetching side/price/qty from state set when order placed
+                    'side' => $this->aiSuggestedSide ?? 'N/A',
+                    'price' => $this->aiSuggestedEntryPrice ?? 0,
+                    'quantity' => $this->aiSuggestedQuantity ?? 0,
+                    'seconds_pending' => $secondsPending,
+                    'timeout_in' => $timeoutIn
                 ];
             }
 
+            // Check consistency: If position exists, but SL/TP IDs are missing, flag it.
+            // This handles cases where SL/TP might have been cancelled externally or failed placement partially.
+             if ($this->currentPositionDetails && (!$this->activeSlOrderId || !$this->activeTpOrderId) && !$this->isPlacingOrManagingOrder) {
+                 if (!$this->isMissingProtectiveOrder) { // Log only when the state changes to missing
+                     $this->logger->warning("Detected open position missing one or both SL/TP orders internally.", [
+                         'position' => $this->currentPositionDetails,
+                         'sl_id' => $this->activeSlOrderId,
+                         'tp_id' => $this->activeTpOrderId
+                     ]);
+                 }
+                 $this->isMissingProtectiveOrder = true;
+             } elseif (!$this->currentPositionDetails) {
+                 $this->isMissingProtectiveOrder = false; // No position, so can't be missing orders
+             }
+             // Note: isMissingProtectiveOrder is also set true on placement failure or margin call
+
 
             $dataForAI = [
+                'current_timestamp' => date('Y-m-d H:i:s'),
                 'current_market_price' => $this->lastClosedKlinePrice,
                 'current_margin_asset_balance' => $currentBalanceInfo['availableBalance'],
                 'margin_asset' => $this->marginAsset,
-                'current_position_raw' => $currentPositionRaw, 
-                'active_pending_entry_order' => $activeEntryOrderDetails, 
-                'historical_klines' => $results['historical_klines'] ?? [], 
+                'current_position_details_formatted' => $this->currentPositionDetails, // Formatted internal state
+                'current_position_raw' => $currentPositionRaw, // Raw API data for position
+                'active_pending_entry_order' => $activeEntryOrderDetails,
+                'position_missing_protective_orders' => $this->isMissingProtectiveOrder, // NEW state flag
+                'last_ai_decision_result' => $this->lastAIDecisionResult, // NEW history field
+                'historical_klines' => $results['historical_klines'] ?? [],
                 'recent_trade_outcomes' => $this->recentOrderLogs,
                 'recent_account_trades' => array_map(function($trade){
                     return ['price' => $trade['price'], 'qty' => $trade['qty'], 'commission' => $trade['commission'], 'realizedPnl' => $trade['realizedPnl'], 'side' => $trade['side'], 'time' => date('Y-m-d H:i:s', (int)($trade['time']/1000))];
@@ -1160,88 +1287,105 @@ class AiTradingBotFutures
                     'tradingSymbol' => $this->tradingSymbol,
                     'klineInterval' => $this->klineInterval,
                     'defaultLeverage' => $this->defaultLeverage,
-                    'amountPercentageBase' => $this->amountPercentage,
                     'aiUpdateIntervalSeconds' => $this->aiUpdateIntervalSeconds,
                     'pendingEntryOrderTimeoutSeconds' => $this->pendingEntryOrderCancelTimeoutSeconds,
                 ],
-                 'trade_logic_summary' => "Bot trades {$this->tradingSymbol} futures using {$this->klineInterval} klines. AI provides leverage, entry price, quantity, SL price, and TP price. Bot places LIMIT entry. On fill, STOP_MARKET SL and TAKE_PROFIT_MARKET TP are placed. AI can also suggest closing an open position. Pending entry orders are automatically cancelled if not filled within {$this->pendingEntryOrderCancelTimeoutSeconds} seconds.",
+                 'trade_logic_summary' => "Bot trades {$this->tradingSymbol} futures using {$this->klineInterval} klines. AI provides parameters. Bot places LIMIT entry. On fill, STOP_MARKET SL and TAKE_PROFIT_MARKET TP are placed. Pending entry orders timeout after {$this->pendingEntryOrderCancelTimeoutSeconds}s. AI can suggest early position close. If SL/TP placement fails, 'position_missing_protective_orders' becomes true.",
             ];
-            $this->logger->debug("Data collected for AI", ['market_price' => $dataForAI['current_market_price'], 'balance' => $dataForAI['current_margin_asset_balance'], 'position_raw_exists' => !is_null($dataForAI['current_position_raw']), 'pending_entry_exists' => !is_null($activeEntryOrderDetails), 'kline_count' => count($dataForAI['historical_klines'])]);
+            $this->logger->debug("Data collected for AI", [
+                'market_price' => $dataForAI['current_market_price'],
+                'balance' => $dataForAI['current_margin_asset_balance'],
+                'position_exists' => !is_null($this->currentPositionDetails),
+                'pending_entry_exists' => !is_null($activeEntryOrderDetails),
+                'missing_orders_flag' => $this->isMissingProtectiveOrder,
+                'kline_count' => is_array($dataForAI['historical_klines']) ? count($dataForAI['historical_klines']) : 'N/A' // Safely count
+                ]);
             return $dataForAI;
         })->catch(function (\Throwable $e) {
-            $this->logger->error("Failed to collect data for AI.", ['exception' => $e->getMessage()]);
-            throw $e;
+            $this->logger->error("Failed to collect data for AI.", ['exception_class'=>get_class($e), 'exception' => $e->getMessage()]);
+            $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Failed data collection: " . $e->getMessage(), 'decision' => null];
+            throw $e; // Re-throw so triggerAIUpdate catches it
         });
     }
 
     private function constructAIPrompt(array $dataForAI, bool $isEmergency): string
     {
-        $promptText = "You are an AI trading assistant for Binance USDM Futures. Your goal is to optimize trading parameters to maximize profit while managing risk for the {$this->tradingSymbol} contract ({$this->klineInterval} interval).\n\n";
+        $promptText = "You are an AI trading assistant for Binance USDM Futures ({$this->tradingSymbol}, {$this->klineInterval}). Your goal is to manage risk and maximize profit.\n\n";
         if ($isEmergency) {
-            $promptText .= "EMERGENCY SITUATION (e.g., margin call, rapid loss). Provide conservative actions or instructions to neutralize risk.\n\n";
+            $promptText .= "INFO: This is an emergency AI trigger, likely due to an unexpected state or error. Review carefully.\n\n";
         }
-        $promptText .= "Bot's Current State & Data:\n";
+        $promptText .= "=== Current Bot State & Data ===\n";
         $dataForPrompt = $dataForAI; // Create a copy to modify for prompt length
-        if (isset($dataForPrompt['historical_klines']) && count($dataForPrompt['historical_klines']) > 50) { // Limit klines in prompt to last 50
-             $dataForPrompt['historical_klines'] = array_slice($dataForPrompt['historical_klines'], -50);
-             $promptText .= "(Showing last 50 historical klines out of " . count($dataForAI['historical_klines']) . " provided to you)\n";
+        // Abbreviate long data fields for prompt clarity
+        if (isset($dataForPrompt['historical_klines'])) { $dataForPrompt['historical_klines'] = "[Showing last " . min(count($dataForAI['historical_klines']), 50) . " klines of ".count($dataForAI['historical_klines'])."...]"; }
+        if (isset($dataForPrompt['recent_trade_outcomes'])) { $dataForPrompt['recent_trade_outcomes'] = "[Showing last " . min(count($dataForAI['recent_trade_outcomes']), 5) . " outcomes...]"; }
+        if (isset($dataForPrompt['recent_account_trades'])) { $dataForPrompt['recent_account_trades'] = "[Showing last " . min(count($dataForAI['recent_account_trades']), 5) . " trades...]"; }
+        $promptText .= json_encode($dataForPrompt, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_IGNORE | JSON_UNESCAPED_SLASHES) . "\n\n";
+
+        // --- Determine Current Bot State & Possible Actions ---
+        $stateDescription = "Unknown";
+        $possibleActions = [];
+
+        if ($dataForAI['position_missing_protective_orders']) {
+            $stateDescription = "CRITICAL: Position Open BUT Protective Orders (SL/TP) Missing!";
+            $possibleActions = ['CLOSE_POSITION', 'HOLD_POSITION']; // Hold is highly risky
+        } elseif ($dataForAI['active_pending_entry_order']) {
+            $stateDescription = "Waiting for Pending Entry Order ({$dataForAI['active_pending_entry_order']['timeout_in']}s remaining)";
+            $possibleActions = ['HOLD_POSITION']; // Only sensible action is to wait
+        } elseif ($dataForAI['current_position_details_formatted']) {
+            $stateDescription = "Position Currently Open (with SL/TP presumed active)";
+            $possibleActions = ['HOLD_POSITION', 'CLOSE_POSITION'];
+        } else {
+            $stateDescription = "No Position and No Pending Entry Order";
+            $possibleActions = ['OPEN_POSITION', 'DO_NOTHING'];
         }
-        // Ensure JSON is valid even if data contains non-UTF8 characters
-        $promptText .= json_encode($dataForPrompt, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_IGNORE) . "\n\n";
 
-        $promptText .= "Historical Klines Format Example:\n";
-        $promptText .= "[{'openTime': 1672531200000, 'open': '20000.0', 'high': '20100.0', 'low': '19900.0', 'close': '20050.0', 'volume': '100.123'}, ...]\n\n";
-        $promptText .= "Active Pending Entry Order Format (if present in data):\n";
-        $promptText .= "{'orderId': '...', 'placedAt': '...', 'side': '...', 'price': ..., 'quantity': ..., 'seconds_pending': ..., 'timeout_in': ...}\n\n";
+        $promptText .= "=== Analysis Task ===\n";
+        $promptText .= "Current State: {$stateDescription}\n";
+        $promptText .= "Last AI Action Result: " . json_encode($dataForAI['last_ai_decision_result'] ?? 'None', JSON_INVALID_UTF8_IGNORE | JSON_UNESCAPED_SLASHES) . "\n";
+        $promptText .= "Analyze all provided data. Based ONLY on the current state ('{$stateDescription}'), choose ONE of the following relevant actions:\n\n";
 
-        $promptText .= "Your Task:\nAnalyze the provided data. Decide the next action. Output a single JSON object string.\n";
-        $promptText .= "If 'active_pending_entry_order' exists in the data, the bot is waiting for that order to fill or timeout (after {$this->pendingEntryOrderCancelTimeoutSeconds} seconds). In this case, you should generally suggest 'HOLD_POSITION'. Do NOT suggest 'OPEN_POSITION' if 'active_pending_entry_order' is present.\n\n";
+        // --- Dynamically List Possible Actions ---
+        $actionList = [];
+        $actionCounter = 1;
+        if (in_array('OPEN_POSITION', $possibleActions)) {
+            $actionList[] = "{$actionCounter}. Open New Position: `{\"action\": \"OPEN_POSITION\", \"leverage\": <int>, \"side\": \"BUY\"|\"SELL\", \"entryPrice\": <float_1dec>, \"quantity\": <float_3dec>, \"stopLossPrice\": <float_1dec>, \"takeProfitPrice\": <float_1dec>}`\n   - Use ONLY if state is 'No Position and No Pending Entry Order'. Follow precision rules (BTCUSDT: Qty 3 dec, Price 1 dec). Aim for ~100 USD risk on SL.";
+            $actionCounter++;
+        }
+        if (in_array('CLOSE_POSITION', $possibleActions)) {
+             $actionList[] = "{$actionCounter}. Close Current Position: `{\"action\": \"CLOSE_POSITION\", \"reason\": \"<brief_reason>\"}`\n   - Strongly recommended if state is 'CRITICAL: ... Missing!'. Also use if analysis suggests immediate exit from a normal open position.";
+             $actionCounter++;
+        }
+        if (in_array('HOLD_POSITION', $possibleActions)) {
+            $actionList[] = "{$actionCounter}. Hold / Wait: `{\"action\": \"HOLD_POSITION\"}`\n   - Use if 'Waiting for Pending Entry Order'. Use if 'Position Currently Open' and analysis suggests keeping it. Can use cautiously if 'CRITICAL: ... Missing!' but closing is safer.";
+            $actionCounter++;
+        }
+         if (in_array('DO_NOTHING', $possibleActions)) {
+             // Explicitly add DO_NOTHING only if it's a valid alternative to OPEN_POSITION
+             if (count($possibleActions) == 2 && in_array('OPEN_POSITION', $possibleActions)) {
+                 $actionList[] = "{$actionCounter}. Do Nothing: `{\"action\": \"DO_NOTHING\"}`\n   - Use ONLY if state is 'No Position and No Pending Entry Order' AND no suitable entry setup is found.";
+                 $actionCounter++;
+             }
+         }
 
-        $promptText .= "Possible Actions & JSON Output Structure:\n";
-        $promptText .= "1. Open a New Position (ONLY if 'active_pending_entry_order' is null AND 'current_position_raw' indicates no open position OR 'current_position_raw' is null):\n";
-        $promptText .= "   {\"action\": \"OPEN_POSITION\", \"leverage\": <int_1_to_125>, \"side\": \"BUY\"_or_\"SELL\", \"entryPrice\": <float_target_entry_price_1_decimal_USDT>, \"quantity\": <float_positive_trade_quantity_3_decimals_BTC>, \"stopLossPrice\": <float_sl_price_1_decimal_USDT>, \"takeProfitPrice\": <float_tp_price_1_decimal_USDT>}\n";
-        $promptText .= "   - For {$this->tradingSymbol}: 'quantity' must be a positive float with 3 decimal places and a multiple of 0.001 (e.g., 0.001, 0.012, 0.100).\n";
-        $promptText .= "   - For {$this->tradingSymbol}: 'entryPrice', 'stopLossPrice', 'takeProfitPrice' must be positive floats with 1 decimal place and a multiple of 0.1 (e.g., 60000.1, 60123.0).\n";
-        $promptText .= "   - Ensure prices are logical: For BUY, SL < Entry < TP. For SELL, SL > Entry > TP.\n\n";
+        $promptText .= implode("\n", $actionList);
+        $promptText .= "\n\n";
 
-        $promptText .= "2. Close Current Position (if 'current_position_raw' indicates an open position and your analysis suggests closing it now, e.g., due to market reversal or target met early):\n";
-        $promptText .= "   {\"action\": \"CLOSE_POSITION\", \"reason\": \"<brief_reason_for_early_closure>\"}\n\n";
+        $promptText .= "=== Important Rules & Guidelines ===\n";
+        $promptText .= "- Adhere strictly to the Possible Actions listed for the current state.\n";
+        $promptText .= "- BTCUSDT Precision: Quantity = 3 decimal places (multiple of 0.001), Price = 1 decimal place (multiple of 0.1).\n";
+        $promptText .= "- Testnet Mode: Be proactive in finding trades ONLY when state is 'No Position and No Pending Entry Order'. Avoid `DO_NOTHING` in that state if a reasonable setup exists.\n";
+        $promptText .= "- Risk Target: New positions should target ~\$100 potential loss if SL hits (`abs(entryPrice - stopLossPrice) * quantity` should approximate 100).\n";
+        $promptText .= "- Critical State: If `position_missing_protective_orders` is true, PRIORITY IS TO CLOSE THE POSITION for safety.\n";
+        $promptText .= "- Logic: Ensure SL/TP prices are logical relative to entry and side (SL protects, TP targets profit).\n\n";
+        //$promptText .= "- Am on testnet.Ignore do nothing! Give active order to test logic after active order.\n\n";
 
-        $promptText .= "3. Hold Current Position/State (Use this if: \n";
-        $promptText .= "   a) 'current_position_raw' indicates an open position and your analysis suggests maintaining it (SL/TP are still valid).\n";
-        $promptText .= "   b) 'active_pending_entry_order' is present (bot is waiting for it to resolve).\n";
-        $promptText .= "   c) Market conditions are unclear but not warranting an immediate close if a position is open.):\n";
-        $promptText .= "   {\"action\": \"HOLD_POSITION\"}\n\n";
+        $promptText .= "Provide ONLY the JSON object for your chosen action as the response. No extra text or markdown formatting.";
 
-        $promptText .= "4. Do Nothing (ONLY if no current position, no active pending entry order, and current market conditions are not suitable for a new trade based on your analysis):\n";
-        $promptText .= "   {\"action\": \"DO_NOTHING\"}\n\n";
-
-        $promptText .= "Key Considerations & Instructions for {$this->tradingSymbol}:\n";
-        $promptText .= "- TESTNET MODE: Actively look for trading opportunities. If no position is open AND no entry order is pending, and you see a valid setup, suggest 'OPEN_POSITION'. Avoid 'DO_NOTHING' unless absolutely necessary.\n";
-        $promptText .= "- LEVERAGE: Choose based on risk and market volatility observed in klines. Default is {$this->defaultLeverage}x.\n";
-        $promptText .= "- QUANTITY PRECISION: Must be 3 decimal places (e.g., 0.001, 0.025, 0.150). Must be a multiple of 0.001.\n";
-        $promptText .= "- PRICE PRECISION: All prices (entry, SL, TP) must be 1 decimal place (e.g., 67012.3, 68000.0). Must be a multiple of 0.1.\n";
-        $promptText .= "- RISK MANAGEMENT (Testnet Target): For an 'OPEN_POSITION' suggestion, aim for a potential loss of approximately 100 USD if the Stop Loss is hit. The formula for PnL on a futures contract is roughly: `(exitPrice - entryPrice) * quantity` for LONG, or `(entryPrice - exitPrice) * quantity` for SHORT. For SL, this means `abs(entryPrice - stopLossPrice) * quantity` should be around `100 / leverage` (if you consider initial margin impact) or simply `100` if thinking about raw PnL before leverage. Given the available margin `{$dataForAI['current_margin_asset_balance']}`, calculate a quantity and SL distance that align with this. Example: if leverage is 10x, a $100 USD loss is a $10 change in underlying value for 1 unit. If quantity is 0.01 BTC, then (entry - SL) should be $10000 to risk $100. Adjust quantity and SL distance accordingly.\n";
-        $promptText .= "- LOGICAL SL/TP: Stop Loss must protect against adverse movement, Take Profit must aim for a reasonable gain.\n";
-        $promptText .= "- DATA ANALYSIS: Focus on `historical_klines`, `current_market_price`, `current_position_raw`, `active_pending_entry_order`, and `recent_trade_outcomes`.\n\n";
-
-        $promptText .= "Example for opening a LONG {$this->tradingSymbol} position:\n";
-        // Adjusted example to better reflect risk calculation: (entry - SL) * qty approx = 100 (if leverage is 1, for simplicity of example)
-        // If entry = 60000, qty = 0.01, to risk $100, (60000 - SL) * 0.01 = 100 => 60000 - SL = 10000 => SL = 50000
-        // This example below is still simplified for prompt brevity and might not be perfect for $100 risk with given numbers
-        $exampleEntry = $dataForAI['current_market_price'] * 0.998 ?? 60000.0;
-        $exampleQty = 0.010; // Let's use a fixed qty for example clarity for AI
-        $exampleSlDistance = 100 / $exampleQty; // Simplified: This is the price diff to lose 100 USD with this qty
-        $exampleSl = $exampleEntry - $exampleSlDistance;
-        $exampleTp = $exampleEntry + ($exampleSlDistance * 1.5); // Example 1:1.5 R:R
-
-        $promptText .= "{\"action\": \"OPEN_POSITION\", \"leverage\": 10, \"side\": \"BUY\", \"entryPrice\": ".sprintf('%.1f', $exampleEntry).", \"quantity\": ".$exampleQty.", \"stopLossPrice\": ".sprintf('%.1f', $exampleSl).", \"takeProfitPrice\": ".sprintf('%.1f', $exampleTp)."}\n\n";
-
-        $promptText .= "Provide ONLY the JSON object as your response, without any surrounding text or markdown formatting (e.g., no \`\`\`json ... \`\`\`).";
-
-        return json_encode(['contents' => [['parts' => [['text' => $promptText]]]], 'generationConfig' => ['temperature' => 0.7]]);
+        // Consider adding safety settings to the generation config if needed
+        // 'safetySettings': [{'category': 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'threshold': 'BLOCK_NONE'}, ...]
+        return json_encode(['contents' => [['parts' => [['text' => $promptText]]]], 'generationConfig' => ['temperature' => 0.6]]);
     }
-
 
     private function sendRequestToAI(string $jsonPayload): PromiseInterface
     {
@@ -1255,7 +1399,7 @@ class AiTradingBotFutures
                 $this->logger->debug('Received response from Gemini AI', ['status' => $response->getStatusCode(), 'body_preview' => substr($body, 0, 200) . '...']);
                 if ($response->getStatusCode() >= 300) {
                     if ($response->getStatusCode() === 429) {
-                        $this->logger->warning('Gemini API rate limit hit (429 Too Many Requests). Will retry later via periodic AI update.');
+                        $this->logger->warning('Gemini API rate limit hit (429 Too Many Requests). Will retry later.');
                         throw new \RuntimeException("HTTP status code 429 (Too Many Requests)", 429);
                     }
                     throw new \RuntimeException("Gemini API HTTP error: " . $response->getStatusCode() . " Body: " . substr($body, 0, 500));
@@ -1263,10 +1407,14 @@ class AiTradingBotFutures
                 return $body;
             },
             function (\Throwable $e) {
-                if ($e->getCode() !== 429) {
-                    $this->logger->error('Gemini AI request failed (Network/Client Error)', ['exception' => $e->getMessage()]);
+                // Don't log error again here if already logged in triggerAIUpdate catch block for non-429 errors
+                if ($e->getCode() === 429) {
+                     $this->logger->warning('Gemini API request failed (429 Rate Limit)', ['exception' => $e->getMessage()]);
+                } elseif (!isset($this->lastAIDecisionResult) || $this->lastAIDecisionResult['status'] !== 'ERROR') {
+                    // Log only if not already logged as a cycle failure or rate limit
+                    $this->logger->error('Gemini AI request failed (Network/Client Error)', ['exception_class' => get_class($e), 'exception' => $e->getMessage()]);
                 }
-                throw $e;
+                throw $e; // Re-throw
             }
         );
     }
@@ -1280,12 +1428,18 @@ class AiTradingBotFutures
                 throw new \InvalidArgumentException("Failed to decode AI JSON response: " . json_last_error_msg());
             }
 
-            $aiTextResponse = $responseDecoded['candidates'][0]['content']['parts'][0]['text'] ?? null;
-            if (!$aiTextResponse) {
-                 throw new \InvalidArgumentException("Could not extract text from AI response. Full response: " . substr($rawResponse,0,500));
-            }
+            // Handle potential Gemini safety blocks or empty responses
+             if (!isset($responseDecoded['candidates'][0]['content']['parts'][0]['text'])) {
+                 $finishReason = $responseDecoded['candidates'][0]['finishReason'] ?? 'UNKNOWN';
+                 $blockReason = $responseDecoded['promptFeedback']['blockReason'] ?? 'None';
+                 $safetyRatings = json_encode($responseDecoded['candidates'][0]['safetyRatings'] ?? []);
+                 throw new \InvalidArgumentException("AI response missing text. Finish Reason: {$finishReason}. Block Reason: {$blockReason}. Safety Ratings: {$safetyRatings}. Full response: " . substr($rawResponse,0,500));
+             }
+             $aiTextResponse = $responseDecoded['candidates'][0]['content']['parts'][0]['text'];
+
 
             $paramsJson = trim($aiTextResponse);
+            // Clean potential markdown
             if (str_starts_with($paramsJson, '```json')) $paramsJson = substr($paramsJson, 7);
             if (str_starts_with($paramsJson, '```')) $paramsJson = substr($paramsJson, 3);
             if (str_ends_with($paramsJson, '```')) $paramsJson = substr($paramsJson, 0, -3);
@@ -1296,7 +1450,7 @@ class AiTradingBotFutures
                 $this->logger->error("Failed to decode JSON parameters from AI's text response.", [
                     'ai_text_response_preview' => substr($aiTextResponse, 0, 200), 'json_error' => json_last_error_msg()
                 ]);
-                throw new \InvalidArgumentException("Failed to decode JSON parameters from AI's text: " . json_last_error_msg() . " - Input: " . substr($aiTextResponse,0,100));
+                throw new \InvalidArgumentException("Failed to decode JSON from AI: " . json_last_error_msg() . " - Input: " . substr($aiTextResponse,0,100));
             }
             $this->executeAIDecision($aiDecision);
 
@@ -1304,22 +1458,59 @@ class AiTradingBotFutures
             $this->logger->error('Error processing AI response or executing decision.', [
                 'exception_class' => get_class($e), 'exception' => $e->getMessage(), 'raw_response_preview' => substr($rawResponse, 0, 500)
             ]);
+             $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Failed processing AI response: " . $e->getMessage(), 'decision' => null];
         }
     }
 
     private function executeAIDecision(array $decision): void
     {
-        $action = strtoupper($decision['action'] ?? 'DO_NOTHING');
+        $action = strtoupper($decision['action'] ?? 'UNKNOWN');
         $this->logger->info("AI Decision Received", ['action' => $action, 'details' => $decision]);
+        $this->lastAIDecisionResult = null; // Reset before processing new decision
 
-        switch ($action) {
+        // --- Validate AI action against current state ---
+        $isValidAction = true;
+        $actionToExecute = $action; // Start with AI's suggestion
+
+        if ($this->isMissingProtectiveOrder) {
+             if ($action !== 'CLOSE_POSITION' && $action !== 'HOLD_POSITION') {
+                 $this->logger->error("Invalid AI Action: Bot in CRITICAL state (missing SL/TP), but AI suggested '{$action}'. Forcing CLOSE.", ['decision' => $decision]);
+                 $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Invalid AI Action '{$action}' during critical state. Forcing Close.", 'decision' => $decision];
+                 $actionToExecute = 'CLOSE_POSITION'; // Override to CLOSE for safety
+                 $isValidAction = true; // Allow the overridden action
+             } elseif ($action === 'HOLD_POSITION') {
+                 $this->logger->warning("AI requested HOLD during CRITICAL state (missing SL/TP). Proceeding with HOLD, but this is risky.", ['decision' => $decision]);
+                 // Allow HOLD, but it's noted as risky.
+             }
+        } elseif ($this->activeEntryOrderId) {
+             if ($action === 'OPEN_POSITION') {
+                 $this->logger->warning("Invalid AI Action: Bot has pending entry order, but AI suggested 'OPEN_POSITION'. Forcing HOLD.", ['decision' => $decision]);
+                 $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "Ignored AI OPEN_POSITION due to pending entry order. Forcing Hold.", 'decision' => $decision];
+                 $actionToExecute = 'HOLD_POSITION'; // Override to HOLD
+                 $isValidAction = false; // Prevent original action logic
+             }
+         } elseif ($this->currentPositionDetails) {
+             if ($action === 'OPEN_POSITION' || $action === 'DO_NOTHING') {
+                  $this->logger->warning("Invalid AI Action: Bot has open position, but AI suggested '{$action}'. Forcing HOLD.", ['decision' => $decision]);
+                  $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "Ignored AI '{$action}' due to open position. Forcing Hold.", 'decision' => $decision];
+                  $actionToExecute = 'HOLD_POSITION'; // Override to HOLD
+                  $isValidAction = false; // Prevent original action logic
+             }
+         } else { // No position, no pending entry
+             if ($action === 'CLOSE_POSITION' || ($action === 'HOLD_POSITION' && !isset($decision['reason'])) /* Allow hold if reason given, else treat as do nothing */ ) {
+                 $this->logger->warning("Invalid AI Action: Bot has no position/pending order, but AI suggested '{$action}'. Forcing DO_NOTHING.", ['decision' => $decision]);
+                 $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "Ignored AI '{$action}' as no position/pending order exists. Forcing Do Nothing.", 'decision' => $decision];
+                 $actionToExecute = 'DO_NOTHING';
+                 $isValidAction = false; // Prevent original action logic
+             }
+         }
+
+
+        // --- Execute Action ---
+        switch ($actionToExecute) {
             case 'OPEN_POSITION':
-                if ($this->currentPositionDetails || $this->activeEntryOrderId) {
-                     $this->logger->warning("AI wants to OPEN_POSITION, but a position/entry order already exists. Holding.", [
-                         'current_pos' => $this->currentPositionDetails, 'active_entry' => $this->activeEntryOrderId
-                     ]);
-                     break; 
-                }
+                if (!$isValidAction) break; // Should have been caught/overridden above
+                // Assign AI parameters
                 $this->aiSuggestedLeverage = (int)($decision['leverage'] ?? $this->defaultLeverage);
                 $this->aiSuggestedSide = strtoupper($decision['side'] ?? '');
                 $this->aiSuggestedEntryPrice = (float)($decision['entryPrice'] ?? 0);
@@ -1327,61 +1518,50 @@ class AiTradingBotFutures
                 $this->aiSuggestedSlPrice = (float)($decision['stopLossPrice'] ?? 0);
                 $this->aiSuggestedTpPrice = (float)($decision['takeProfitPrice'] ?? 0);
 
-                $proceedWithOpen = true;
+                // Log potential validation issues found previously, but proceed
+                 if (!in_array($this->aiSuggestedSide, ['BUY', 'SELL']) || $this->aiSuggestedEntryPrice <= 0 || $this->aiSuggestedQuantity <= 0 || $this->aiSuggestedSlPrice <= 0 || $this->aiSuggestedTpPrice <= 0) {
+                     $this->logger->error("AI OPEN_POSITION: Parameters appear invalid (zero/negative) - attempting anyway.", $decision);
+                 }
+                 if (fmod(round($this->aiSuggestedQuantity,3), 0.001) > 1e-9) { // Use tolerance for float comparison
+                     $this->logger->warning("AI OPEN_POSITION: Suggested quantity {$this->aiSuggestedQuantity} not multiple of 0.001 - attempting anyway.", $decision);
+                 }
+                 if (fmod(round($this->aiSuggestedEntryPrice,1), 0.1) > 1e-9 || fmod(round($this->aiSuggestedSlPrice,1), 0.1) > 1e-9 || fmod(round($this->aiSuggestedTpPrice,1), 0.1) > 1e-9) {
+                      $this->logger->warning("AI OPEN_POSITION: Suggested prices do not meet 0.1 step size - attempting anyway.", $decision);
+                 }
+                 if ($this->aiSuggestedSide === 'BUY' && ($this->aiSuggestedSlPrice >= $this->aiSuggestedEntryPrice || $this->aiSuggestedTpPrice <= $this->aiSuggestedEntryPrice)) {
+                      $this->logger->error("AI OPEN_POSITION (BUY): Illogical SL/TP vs Entry - attempting anyway.", $decision);
+                 }
+                  if ($this->aiSuggestedSide === 'SELL' && ($this->aiSuggestedSlPrice <= $this->aiSuggestedEntryPrice || $this->aiSuggestedTpPrice >= $this->aiSuggestedEntryPrice)) {
+                      $this->logger->error("AI OPEN_POSITION (SELL): Illogical SL/TP vs Entry - attempting anyway.", $decision);
+                  }
 
-                // Log validation checks but do not break or modify values here
-                if (!in_array($this->aiSuggestedSide, ['BUY', 'SELL']) || $this->aiSuggestedEntryPrice <= 0 || $this->aiSuggestedQuantity <= 0 || $this->aiSuggestedSlPrice <= 0 || $this->aiSuggestedTpPrice <= 0) {
-                    $this->logger->error("AI OPEN_POSITION: Parameters appear invalid (zero/negative).", $decision);
-                    // $proceedWithOpen = false; // Removed to only log
-                }
-                if (fmod(round($this->aiSuggestedQuantity,3), 0.001) != 0) { 
-                    $this->logger->warning("AI OPEN_POSITION: Suggested quantity {$this->aiSuggestedQuantity} is not a multiple of 0.001.", $decision);
-                    // No modification of $this->aiSuggestedQuantity
-                }
-                if (fmod(round($this->aiSuggestedEntryPrice,1), 0.1) != 0 || fmod(round($this->aiSuggestedSlPrice,1), 0.1) != 0 || fmod(round($this->aiSuggestedTpPrice,1), 0.1) != 0) {
-                     $this->logger->warning("AI OPEN_POSITION: Suggested prices do not meet 0.1 step size requirement.", $decision);
-                     // $proceedWithOpen = false; // Removed to only log
-                }
-
-                if ($this->aiSuggestedSide === 'BUY' && ($this->aiSuggestedSlPrice >= $this->aiSuggestedEntryPrice || $this->aiSuggestedTpPrice <= $this->aiSuggestedEntryPrice)) {
-                     $this->logger->error("AI OPEN_POSITION (BUY): Illogical SL/TP vs Entry.", $decision);
-                     // $proceedWithOpen = false; // Removed to only log
-                }
-                 if ($this->aiSuggestedSide === 'SELL' && ($this->aiSuggestedSlPrice <= $this->aiSuggestedEntryPrice || $this->aiSuggestedTpPrice >= $this->aiSuggestedEntryPrice)) {
-                     $this->logger->error("AI OPEN_POSITION (SELL): Illogical SL/TP vs Entry.", $decision);
-                     // $proceedWithOpen = false; // Removed to only log
-                }
-                
-                // Always attempt to open if AI suggests it, after logging any validation concerns.
-                // The `attemptOpenPosition` itself has a check for positive quantity/price before calling the API method.
-                // The API method `placeFuturesLimitOrder` has its own strict checks and sprintf formatting.
-                if ($this->aiSuggestedQuantity <= 0 || $this->aiSuggestedEntryPrice <=0) { // Minimal final check before attempting
-                    $this->logger->error("AI OPEN_POSITION: Final check - quantity or entry price is zero/negative. Cannot proceed.", [
-                        'qty' => $this->aiSuggestedQuantity, 'entry' => $this->aiSuggestedEntryPrice
-                    ]);
-                } else {
-                    $this->attemptOpenPosition();
-                }
+                 if ($this->aiSuggestedQuantity <= 0 || $this->aiSuggestedEntryPrice <=0) {
+                     $this->logger->error("AI OPEN_POSITION: Final check - quantity or entry price is zero/negative. Cannot proceed.");
+                      $this->lastAIDecisionResult = ['status' => 'ERROR', 'message' => "Rejected OPEN_POSITION: Invalid qty/price.", 'decision' => $decision];
+                 } else {
+                     // Attempt to open position (outcome stored in $lastAIDecisionResult within the attempt function)
+                     $this->attemptOpenPosition();
+                 }
                 break;
 
             case 'CLOSE_POSITION':
-                if (!$this->currentPositionDetails) {
-                    $this->logger->info("AI wants to CLOSE_POSITION, but no position exists.");
-                    break;
-                }
+                 // Attempt to close (outcome stored in $lastAIDecisionResult within the attempt function)
                 $this->attemptClosePositionByAI();
                 break;
 
             case 'HOLD_POSITION':
-                $this->logger->info("AI recommends HOLD_POSITION. No action taken.");
-                break;
+                 $this->logger->info("AI recommended HOLD / Wait. No trade action taken.", ['reason' => $decision['reason'] ?? 'N/A']);
+                 $this->lastAIDecisionResult = ['status' => 'OK', 'message' => 'Holding position/state as per AI.', 'decision' => $decision];
+                 break;
 
             case 'DO_NOTHING':
-                $this->logger->info("AI recommends DO_NOTHING. No action taken.");
-                break;
+                 $this->logger->info("AI recommended DO_NOTHING. No trade action taken.");
+                 $this->lastAIDecisionResult = ['status' => 'OK', 'message' => 'No action taken as per AI.', 'decision' => $decision];
+                 break;
 
-            default:
-                $this->logger->warning("Unknown AI action received.", ['action' => $action]);
+            default: // Includes UNKNOWN
+                $this->logger->warning("Unknown or unhandled AI action received.", ['action' => $actionToExecute, 'original_decision' => $decision]);
+                $this->lastAIDecisionResult = ['status' => 'WARN', 'message' => "Unknown AI action '{$actionToExecute}'.", 'decision' => $decision];
         }
     }
 }
@@ -1399,12 +1579,12 @@ $bot = new AiTradingBotFutures(
     klineInterval: '1m',
     marginAsset: 'USDT',
     defaultLeverage: 10,
-    amountPercentage: 10.0,
-    orderCheckIntervalSeconds: 10, 
-    maxScriptRuntimeSeconds: 86400,
-    aiUpdateIntervalSeconds: 20, 
+    amountPercentage: 10.0, // This is currently unused, AI calculates absolute quantity
+    orderCheckIntervalSeconds: 5, // Check reasonably often for timeouts/fallbacks
+    maxScriptRuntimeSeconds: 86400, // 24 hours
+    aiUpdateIntervalSeconds: 10, // AI update interval
     useTestnet: $useTestnet,
-    pendingEntryOrderCancelTimeoutSeconds: 30 
+    pendingEntryOrderCancelTimeoutSeconds: 30 // 3 minutes timeout for pending entry
 );
 
 $bot->run();
